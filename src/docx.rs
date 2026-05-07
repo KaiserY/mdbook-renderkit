@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use mdbook_renderer::RenderContext;
@@ -17,7 +17,7 @@ pub fn render(ctx: &RenderContext) -> Result<()> {
     fs::create_dir_all(&ctx.destination)
         .with_context(|| format!("failed to create {}", ctx.destination.display()))?;
 
-    let output = ctx.destination.join("book.docx");
+    let output = output_filename(ctx, "docx");
     eprintln!(
         "renderkit: rendering {} chapters to {}",
         ctx.book.chapters().count(),
@@ -28,6 +28,13 @@ pub fn render(ctx: &RenderContext) -> Result<()> {
     eprintln!("renderkit: wrote {}", output.display());
 
     Ok(())
+}
+
+fn output_filename(ctx: &RenderContext, extension: &str) -> PathBuf {
+    match ctx.config.book.title {
+        Some(ref title) => ctx.destination.join(title).with_extension(extension),
+        None => ctx.destination.join("book").with_extension(extension),
+    }
 }
 
 fn write_docx(ctx: &RenderContext, path: &Path) -> Result<()> {

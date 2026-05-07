@@ -12,6 +12,8 @@ command = "mdbook-renderkit render-pdf"
 # template = "theme/pdf.typ"
 # Optional, converts ```admonish ... fences into styled blocks.
 # admonish = false
+# Optional, use mdBook's chapter numbers for PDF bookmark titles and levels.
+# section-number = false
 
 [output.docx]
 command = "mdbook-renderkit render-docx"

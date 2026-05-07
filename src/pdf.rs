@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use mdbook_renderer::RenderContext;
 use mdbook_renderer::book::{BookItem, Chapter};
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use typst::Library;
 use typst::diag::{FileError, FileResult, SourceDiagnostic};
 use typst::foundations::{Bytes, Datetime, Smart};
@@ -26,6 +26,7 @@ const CONTENT_PLACEHOLDER: &str = "/**** MDBOOK_RENDERKIT_CONTENT ****/";
 struct PdfConfig {
     template: Option<PathBuf>,
     admonish: bool,
+    section_number: bool,
 }
 
 pub fn render(ctx: &RenderContext) -> Result<()> {
@@ -33,8 +34,8 @@ pub fn render(ctx: &RenderContext) -> Result<()> {
         .with_context(|| format!("failed to create {}", ctx.destination.display()))?;
 
     let typst = render_typst(ctx)?;
-    let typst_path = ctx.destination.join("book.typ");
-    let pdf_path = ctx.destination.join("book.pdf");
+    let typst_path = output_filename(ctx, "typ");
+    let pdf_path = output_filename(ctx, "pdf");
 
     eprintln!(
         "renderkit: rendering {} chapters to {}",
@@ -71,6 +72,13 @@ fn load_config(ctx: &RenderContext) -> Result<PdfConfig> {
     Ok(ctx.config.get("output.pdf")?.unwrap_or_default())
 }
 
+fn output_filename(ctx: &RenderContext, extension: &str) -> PathBuf {
+    match ctx.config.book.title {
+        Some(ref title) => ctx.destination.join(title).with_extension(extension),
+        None => ctx.destination.join("book").with_extension(extension),
+    }
+}
+
 fn load_template(ctx: &RenderContext, cfg: &PdfConfig) -> Result<String> {
     if let Some(template) = &cfg.template {
         let path = ctx.root.join(template);
@@ -101,15 +109,6 @@ fn render_chapter(
     chapter: &Chapter,
     output: &mut String,
 ) -> Result<()> {
-    let level = chapter
-        .number
-        .as_ref()
-        .map_or(1, |number| number.len().max(1));
-    output.push_str("#heading(level: ");
-    output.push_str(&level.to_string());
-    output.push_str(")[");
-    output.push_str(&escape_typst(&chapter.name));
-    output.push_str("]\n\n");
     output.push_str(&markdown_to_typst(ctx, cfg, chapter)?);
 
     Ok(())
@@ -120,6 +119,7 @@ struct ChapterContext<'a> {
     destination: &'a Path,
     chapter_dir: Option<PathBuf>,
     chapter_rel_dir: Option<&'a Path>,
+    label: String,
 }
 
 impl<'a> ChapterContext<'a> {
@@ -127,12 +127,18 @@ impl<'a> ChapterContext<'a> {
         let source_dir = ctx.root.join(&ctx.config.book.src);
         let chapter_rel_dir = chapter.source_path.as_ref().and_then(|path| path.parent());
         let chapter_dir = chapter_rel_dir.map(|path| source_dir.join(path));
+        let label = chapter
+            .source_path
+            .as_ref()
+            .map(|path| label_for_output_path(&md_path_to_html(path)))
+            .unwrap_or_else(|| "chapter".to_string());
 
         Self {
             source_dir,
             destination: &ctx.destination,
             chapter_dir,
             chapter_rel_dir,
+            label,
         }
     }
 }
@@ -159,6 +165,8 @@ fn markdown_to_typst(ctx: &RenderContext, cfg: &PdfConfig, chapter: &Chapter) ->
     let mut code_block: Option<(String, String)> = None;
     let mut admonish: Option<(String, String, String)> = None;
     let mut inline_stack = Vec::new();
+    let mut heading = String::new();
+    let mut wrote_invisible_heading = false;
 
     for event in parser {
         if let Some((_, _, body)) = &mut admonish {
@@ -198,13 +206,30 @@ fn markdown_to_typst(ctx: &RenderContext, cfg: &PdfConfig, chapter: &Chapter) ->
             Event::End(TagEnd::Paragraph) => output.push_str("\n\n"),
             Event::Start(Tag::Heading { level, .. }) => {
                 inline_stack.push(InlineState::Heading);
+                heading.clear();
+                let level_usize = markdown_heading_level(cfg, chapter, level as usize);
                 output.push_str("#heading(level: ");
-                output.push_str(&heading_level(level).to_string());
+                output.push_str(&level_usize.to_string());
+                output.push_str(", outlined: false, bookmarked: false");
                 output.push_str(")[");
             }
-            Event::End(TagEnd::Heading(_)) => {
+            Event::End(TagEnd::Heading(level)) => {
                 inline_stack.pop();
-                output.push_str("]\n\n");
+                let level_usize = markdown_heading_level(cfg, chapter, level as usize);
+                output.push_str("]\n");
+
+                if !wrote_invisible_heading {
+                    render_invisible_chapter_heading(
+                        &mut output,
+                        cfg,
+                        chapter,
+                        &chapter_ctx,
+                        level_usize,
+                    );
+                    wrote_invisible_heading = true;
+                }
+
+                output.push('\n');
             }
             Event::Start(Tag::Emphasis) => output.push_str("#emph["),
             Event::End(TagEnd::Emphasis) => output.push(']'),
@@ -265,10 +290,19 @@ fn markdown_to_typst(ctx: &RenderContext, cfg: &PdfConfig, chapter: &Chapter) ->
                 inline_stack.pop();
                 output.push('\n');
             }
-            Event::Code(text) => render_raw(&mut output, &text, false, None),
+            Event::Code(text) => {
+                if inline_stack.contains(&InlineState::Heading) {
+                    heading.push_str(&text);
+                }
+                render_raw(&mut output, &text, false, None);
+            }
             Event::Text(text) => {
                 if inline_stack.contains(&InlineState::Image) {
                     continue;
+                }
+
+                if inline_stack.contains(&InlineState::Heading) {
+                    heading.push_str(&text);
                 }
 
                 if inline_stack.last() == Some(&InlineState::TableHead) {
@@ -324,18 +358,69 @@ fn render_table_start(output: &mut String, align: &[Alignment]) {
     output.push_str("),\n");
 }
 
-fn render_link_start(output: &mut String, ctx: &ChapterContext<'_>, dest_url: &str) {
-    let url = if is_remote_url(dest_url) {
-        dest_url.to_string()
-    } else if looks_like_email(dest_url) {
-        format!("mailto:{dest_url}")
-    } else {
-        normalize_relative_link(ctx.chapter_rel_dir, dest_url)
-    };
+fn markdown_heading_level(cfg: &PdfConfig, chapter: &Chapter, markdown_level: usize) -> usize {
+    if cfg.section_number {
+        if let Some(number) = &chapter.number {
+            return number.len().max(1) + markdown_level.saturating_sub(1);
+        }
+    }
 
-    output.push_str("#link(\"");
-    output.push_str(&escape_typst_string(&url));
-    output.push_str("\")[");
+    markdown_level
+}
+
+fn render_invisible_chapter_heading(
+    output: &mut String,
+    cfg: &PdfConfig,
+    chapter: &Chapter,
+    ctx: &ChapterContext<'_>,
+    level_usize: usize,
+) {
+    output.push('\n');
+
+    if let Some(number) = &chapter.number {
+        if cfg.section_number {
+            output.push_str("#{\n  show heading: none\n  heading(numbering: none, level: ");
+            output.push_str(&number.len().to_string());
+            output.push_str(", outlined: true, bookmarked: true)[#\"");
+            output.push_str(&escape_typst_string(&format!("{number} {}", chapter.name)));
+            output.push_str("\"]\n} <");
+        } else {
+            output.push_str("#{\n  show heading: none\n  heading(numbering: none, level: ");
+            output.push_str(&level_usize.to_string());
+            output.push_str(", outlined: true, bookmarked: true)[");
+            output.push_str(&escape_typst(&chapter.name));
+            output.push_str("]\n} <");
+        }
+    } else {
+        output.push_str(
+            "#{\n  show heading: none\n  heading(numbering: none, level: 1, outlined: true, bookmarked: true)[",
+        );
+        output.push_str(&escape_typst(&chapter.name));
+        output.push_str("]\n} <");
+    }
+
+    output.push_str(&ctx.label);
+    output.push_str(">\n");
+}
+
+fn render_link_start(output: &mut String, ctx: &ChapterContext<'_>, dest_url: &str) {
+    if let Some(label) = local_md_link_label(ctx.chapter_rel_dir, dest_url) {
+        output.push_str("#link(<");
+        output.push_str(&label);
+        output.push_str(">)[");
+    } else {
+        let url = if is_remote_url(dest_url) {
+            dest_url.to_string()
+        } else if looks_like_email(dest_url) {
+            format!("mailto:{dest_url}")
+        } else {
+            normalize_relative_link(ctx.chapter_rel_dir, dest_url)
+        };
+
+        output.push_str("#link(\"");
+        output.push_str(&escape_typst_string(&url));
+        output.push_str("\")[");
+    }
 }
 
 fn render_image(output: &mut String, ctx: &ChapterContext<'_>, dest_url: &str) -> Result<()> {
@@ -475,6 +560,26 @@ fn normalize_relative_link(chapter_rel_dir: Option<&Path>, dest_url: &str) -> St
     } else {
         normalized
     }
+}
+
+fn local_md_link_label(chapter_rel_dir: Option<&Path>, dest_url: &str) -> Option<String> {
+    if is_remote_url(dest_url) || looks_like_email(dest_url) {
+        return None;
+    }
+
+    let path = strip_fragment(dest_url);
+    if path.is_empty() || !path.ends_with(".md") {
+        return None;
+    }
+
+    let output_path = md_path_to_html(&normalize_output_path(chapter_rel_dir, path));
+    Some(label_for_output_path(&output_path))
+}
+
+fn md_path_to_html(path: &Path) -> PathBuf {
+    let mut output = path.to_path_buf();
+    output.set_extension("html");
+    output
 }
 
 fn normalized_output_path_str(chapter_rel_dir: Option<&Path>, target: &str) -> String {
@@ -721,17 +826,6 @@ impl World for PdfWorld {
     }
 }
 
-fn heading_level(level: HeadingLevel) -> usize {
-    match level {
-        HeadingLevel::H1 => 1,
-        HeadingLevel::H2 => 2,
-        HeadingLevel::H3 => 3,
-        HeadingLevel::H4 => 4,
-        HeadingLevel::H5 => 5,
-        HeadingLevel::H6 => 6,
-    }
-}
-
 fn escape_typst(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -744,6 +838,27 @@ fn escape_typst(text: &str) -> String {
         }
     }
     escaped
+}
+
+fn label_for_output_path(path: &Path) -> String {
+    escape_typst_label(&path.to_string_lossy())
+}
+
+fn escape_typst_label(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            escaped.push(ch);
+        } else {
+            escaped.push('-');
+        }
+    }
+
+    if escaped.is_empty() {
+        "chapter".to_string()
+    } else {
+        escaped
+    }
 }
 
 fn escape_typst_string(text: &str) -> String {
