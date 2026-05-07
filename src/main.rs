@@ -77,7 +77,7 @@ impl Renderer for PdfBackend {
   }
 
   fn render(&self, ctx: &RenderContext) -> mdbook_renderer::errors::Result<()> {
-    pdf::render(ctx).map_err(Into::into)
+    pdf::render(ctx)
   }
 }
 
@@ -89,6 +89,6 @@ impl Renderer for DocxBackend {
   }
 
   fn render(&self, ctx: &RenderContext) -> mdbook_renderer::errors::Result<()> {
-    docx::render(ctx).map_err(Into::into)
+    docx::render(ctx)
   }
 }

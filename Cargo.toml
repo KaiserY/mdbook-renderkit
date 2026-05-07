@@ -16,3 +16,4 @@ clap = "4.6.1"
 pulldown-cmark = "0.13.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+syntect = "5.3.0"

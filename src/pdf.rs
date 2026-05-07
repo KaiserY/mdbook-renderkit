@@ -353,10 +353,10 @@ fn render_table_start(output: &mut String, align: &[Alignment]) {
 }
 
 fn markdown_heading_level(cfg: &PdfConfig, chapter: &Chapter, markdown_level: usize) -> usize {
-  if cfg.section_number {
-    if let Some(number) = &chapter.number {
-      return number.len().max(1) + markdown_level.saturating_sub(1);
-    }
+  if cfg.section_number
+    && let Some(number) = &chapter.number
+  {
+    return number.len().max(1) + markdown_level.saturating_sub(1);
   }
 
   markdown_level

@@ -11,24 +11,32 @@ use ooxmlsdk::parts::numbering_definitions_part::NumberingDefinitionsPart;
 use ooxmlsdk::parts::wordprocessing_document::WordprocessingDocument;
 use ooxmlsdk::schemas::opc_relationships::TargetMode;
 use ooxmlsdk::schemas::schemas_openxmlformats_org_wordprocessingml_2006_main::{
-  AbstractNum, AbstractNumId, Body, BodyChoice, Bold, BookmarkEnd, BookmarkStart, Break,
-  BreakValues, Color, Document, FieldChar, FieldCharValues, FieldCode, Hyperlink, HyperlinkChoice,
-  Indentation, Italic, Level, LevelJustification, LevelJustificationValues, LevelSuffix,
-  LevelSuffixValues, LevelText, MultiLevelType, MultiLevelValues, NumberFormatValues, Numbering,
-  NumberingFormat, NumberingId, NumberingInstance, NumberingLevelReference, NumberingProperties,
-  Paragraph, ParagraphChoice, ParagraphChoice2, ParagraphProperties, ParagraphStyleId, Run,
-  RunChoice, RunFonts, RunProperties, RunStyle as WordRunStyle, Shading, ShadingPatternValues,
-  StartNumberingValue, Strike, TabStop, TabStopLeaderCharValues, TabStopValues, Table, TableCell,
-  TableCellChoice, TableCellProperties, TableCellWidth, TableChoice2, TableProperties, TableRow,
-  TableRowChoice, TableStyle, TableWidth, TableWidthUnitValues, Tabs, Text,
+  AbstractNum, AbstractNumId, Body, BodyChoice, Bold, BookmarkEnd, BookmarkStart, BorderValues,
+  BottomBorder, Break, BreakValues, Color, Document, FieldChar, FieldCharValues, FieldCode,
+  FontSize, FontSizeComplexScript, Hyperlink, HyperlinkChoice, Indentation, InsideHorizontalBorder,
+  InsideVerticalBorder, Italic, Justification, JustificationValues, LeftBorder, Level,
+  LevelJustification, LevelJustificationValues, LevelOverride, LevelSuffix, LevelSuffixValues,
+  LevelText, LineSpacingRuleValues, MultiLevelType, MultiLevelValues, NumberFormatValues,
+  Numbering, NumberingFormat, NumberingId, NumberingInstance, NumberingLevelReference,
+  NumberingProperties, Paragraph, ParagraphChoice, ParagraphChoice2, ParagraphProperties,
+  ParagraphStyleId, RightBorder, Run, RunChoice, RunFonts, RunProperties, RunStyle as WordRunStyle,
+  Shading, ShadingPatternValues, SpacingBetweenLines, StartNumberingValue,
+  StartOverrideNumberingValue, Strike, TabStop, TabStopLeaderCharValues, TabStopValues, Table,
+  TableBorders, TableCell, TableCellChoice, TableCellProperties, TableCellWidth, TableChoice2,
+  TableProperties, TableRow, TableRowChoice, TableStyle, TableWidth, TableWidthUnitValues, Tabs,
+  Text, TopBorder, Underline, UnderlineValues,
 };
+use ooxmlsdk::schemas::www_w3_org_xml_1998_namespace::SpaceProcessingModeValues;
 use ooxmlsdk::sdk::WordprocessingDocumentType;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Color as SyntectColor, FontStyle as SyntectFontStyle, Style, Theme};
+use syntect::parsing::SyntaxSet;
 
 const BULLET_NUM_ID: i32 = 1;
-const ORDERED_NUM_ID: i32 = 2;
 const TASK_DONE_NUM_ID: i32 = 3;
 const TASK_TODO_NUM_ID: i32 = 4;
+const FIRST_ORDERED_NUM_ID: i32 = 10;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -36,6 +44,8 @@ struct DocxConfig {
   section_number: bool,
   toc: bool,
   toc_depth: usize,
+  code_highlight: bool,
+  code_theme: String,
 }
 
 impl Default for DocxConfig {
@@ -44,6 +54,8 @@ impl Default for DocxConfig {
       section_number: false,
       toc: true,
       toc_depth: 3,
+      code_highlight: true,
+      code_theme: "InspiredGitHub".to_string(),
     }
   }
 }
@@ -84,13 +96,14 @@ fn write_docx(ctx: &RenderContext, path: &Path) -> Result<()> {
   let cfg = load_config(ctx)?;
   let numbering_part = package.add_new_part_auto_id::<NumberingDefinitionsPart>()?;
   let numbering_part = main_part.add_part(&mut package, numbering_part)?;
-  numbering_part.set_root_element(&mut package, numbering_definitions())?;
 
-  let document = {
-    let mut docx = DocxRenderContext::new(&mut package, &main_part);
-    document(ctx, &cfg, &mut docx)?
+  let (document, ordered_lists) = {
+    let mut docx = DocxRenderContext::new(&mut package, &main_part, &cfg);
+    let document = document(ctx, &cfg, &mut docx)?;
+    (document, docx.ordered_lists)
   };
   main_part.set_root_element(&mut package, document)?;
+  numbering_part.set_root_element(&mut package, numbering_definitions(&ordered_lists))?;
 
   let file = File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
   package.save(file)?;
@@ -116,7 +129,10 @@ fn document(
   if let Some(title) = &ctx.config.book.title {
     body
       .body_choice
-      .push(BodyChoice::WP(Box::new(title_paragraph(title))));
+      .push(BodyChoice::WP(Box::new(cover_title_paragraph(title))));
+    body
+      .body_choice
+      .push(BodyChoice::WP(Box::new(page_break_paragraph())));
   }
 
   if cfg.toc {
@@ -194,7 +210,7 @@ fn chapter_body(
       match event {
         Event::End(TagEnd::CodeBlock) => {
           let (lang, code) = code_block.take().expect("checked above");
-          push_code_block(&mut out, &mut table, &lang, &code);
+          push_code_block(&mut out, &mut table, docx, &lang, &code)?;
         }
         Event::Text(text) => code.push_str(&text),
         Event::SoftBreak | Event::HardBreak => code.push('\n'),
@@ -234,7 +250,10 @@ fn chapter_body(
         quote_depth += 1;
       }
       Event::End(TagEnd::BlockQuote(_)) => quote_depth = quote_depth.saturating_sub(1),
-      Event::Start(Tag::List(start)) => lists.push(ListState::new(start)),
+      Event::Start(Tag::List(start)) => {
+        let level = lists.len();
+        lists.push(ListState::new(start, level, docx));
+      }
       Event::End(TagEnd::List(_)) => {
         lists.pop();
       }
@@ -315,7 +334,7 @@ fn chapter_body(
         paragraph.push_text("]");
       }
       Event::Code(text) => {
-        paragraph.push_run(
+        paragraph.push_inline_code(
           &text,
           RunStyle {
             code: true,
@@ -356,22 +375,43 @@ fn chapter_body(
 struct DocxRenderContext<'a> {
   package: &'a mut WordprocessingDocument,
   main_part: &'a MainDocumentPart,
+  highlighter: CodeHighlighter,
+  ordered_lists: Vec<OrderedListDefinition>,
   hyperlinks: HashMap<String, String>,
   bookmarks: HashMap<PathBuf, String>,
   bookmark_ids: HashMap<String, String>,
   next_bookmark_id: usize,
+  next_numbering_id: i32,
 }
 
 impl<'a> DocxRenderContext<'a> {
-  fn new(package: &'a mut WordprocessingDocument, main_part: &'a MainDocumentPart) -> Self {
+  fn new(
+    package: &'a mut WordprocessingDocument,
+    main_part: &'a MainDocumentPart,
+    cfg: &DocxConfig,
+  ) -> Self {
     Self {
       package,
       main_part,
+      highlighter: CodeHighlighter::new(cfg),
+      ordered_lists: Vec::new(),
       hyperlinks: HashMap::new(),
       bookmarks: HashMap::new(),
       bookmark_ids: HashMap::new(),
       next_bookmark_id: 1,
+      next_numbering_id: FIRST_ORDERED_NUM_ID,
     }
+  }
+
+  fn ordered_numbering_id(&mut self, level: usize, start: u64) -> i32 {
+    let number_id = self.next_numbering_id;
+    self.next_numbering_id += 1;
+    self.ordered_lists.push(OrderedListDefinition {
+      number_id,
+      level,
+      start,
+    });
+    number_id
   }
 
   fn link_target(&mut self, chapter: &Chapter, url: &str) -> Result<LinkTarget> {
@@ -435,6 +475,99 @@ impl<'a> DocxRenderContext<'a> {
 }
 
 #[derive(Clone, Debug)]
+struct OrderedListDefinition {
+  number_id: i32,
+  level: usize,
+  start: u64,
+}
+
+struct CodeHighlighter {
+  enabled: bool,
+  syntax_set: SyntaxSet,
+  theme: Theme,
+  background: String,
+}
+
+impl CodeHighlighter {
+  fn new(cfg: &DocxConfig) -> Self {
+    let syntax_set = SyntaxSet::load_defaults_newlines();
+    let theme_set = syntect::highlighting::ThemeSet::load_defaults();
+    let theme = theme_set
+      .themes
+      .get(&cfg.code_theme)
+      .or_else(|| theme_set.themes.get("InspiredGitHub"))
+      .or_else(|| theme_set.themes.values().next())
+      .cloned()
+      .unwrap_or_default();
+    let background = theme
+      .settings
+      .background
+      .map(color_to_hex)
+      .filter(|color| color != "FFFFFF")
+      .unwrap_or_else(|| "F0F0F0".to_string());
+
+    Self {
+      enabled: cfg.code_highlight,
+      syntax_set,
+      theme,
+      background,
+    }
+  }
+
+  fn lines(&self, lang: &str, code: &str) -> Result<Vec<Vec<CodeRun>>> {
+    let lang = lang.split([',', ' ']).next().unwrap_or_default().trim();
+    let Some(syntax) = self.syntax_set.find_syntax_by_token(lang) else {
+      return Ok(plain_code_lines(code));
+    };
+    if !self.enabled || lang.is_empty() {
+      return Ok(plain_code_lines(code));
+    }
+
+    let mut highlighter = HighlightLines::new(syntax, &self.theme);
+    code_lines(code)
+      .into_iter()
+      .map(|line| {
+        let ranges = highlighter.highlight_line(line, &self.syntax_set)?;
+        Ok(
+          ranges
+            .into_iter()
+            .map(|(style, content)| CodeRun {
+              text: content.to_string(),
+              style: style.into(),
+            })
+            .collect(),
+        )
+      })
+      .collect()
+  }
+}
+
+#[derive(Clone, Debug)]
+struct CodeRun {
+  text: String,
+  style: CodeRunStyle,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CodeRunStyle {
+  color: Option<String>,
+  bold: bool,
+  italic: bool,
+  underline: bool,
+}
+
+impl From<Style> for CodeRunStyle {
+  fn from(style: Style) -> Self {
+    Self {
+      color: Some(color_to_hex(style.foreground)),
+      bold: style.font_style.contains(SyntectFontStyle::BOLD),
+      italic: style.font_style.contains(SyntectFontStyle::ITALIC),
+      underline: style.font_style.contains(SyntectFontStyle::UNDERLINE),
+    }
+  }
+}
+
+#[derive(Clone, Debug)]
 struct BookmarkRef {
   id: String,
   name: String,
@@ -446,14 +579,11 @@ struct ListState {
 }
 
 impl ListState {
-  fn new(start: Option<u64>) -> Self {
-    Self {
-      numbering_id: if start.is_some() {
-        ORDERED_NUM_ID
-      } else {
-        BULLET_NUM_ID
-      },
-    }
+  fn new(start: Option<u64>, level: usize, docx: &mut DocxRenderContext<'_>) -> Self {
+    let numbering_id = start.map_or(BULLET_NUM_ID, |start| {
+      docx.ordered_numbering_id(level, start)
+    });
+    Self { numbering_id }
   }
 
   fn numbering_id(&self) -> i32 {
@@ -527,6 +657,10 @@ impl ParagraphBuilder {
     self.push_run(text, self.current_run_style());
   }
 
+  fn push_inline_code(&mut self, text: &str, style: RunStyle) {
+    self.push_run(text, style);
+  }
+
   fn current_run_style(&self) -> RunStyle {
     RunStyle {
       bold: self.style.bold > 0,
@@ -545,7 +679,7 @@ impl ParagraphBuilder {
     for (index, line) in text.split('\n').enumerate() {
       if index > 0 {
         self.runs.push(ParagraphChoice::WR(Box::new(Run {
-          run_choice: vec![RunChoice::WBr(Box::new(Break::default()))],
+          run_choice: vec![RunChoice::WBr(Box::default())],
           ..Default::default()
         })));
       }
@@ -683,6 +817,7 @@ impl TableBuilder {
           width: Some("5000".to_string()),
           r#type: Some(TableWidthUnitValues::Pct),
         }),
+        table_borders: Some(Box::new(table_borders())),
         ..Default::default()
       })),
       table_choice2: self
@@ -736,18 +871,100 @@ fn push_paragraph(
 fn push_code_block(
   out: &mut Vec<BodyChoice>,
   table: &mut Option<TableBuilder>,
+  docx: &DocxRenderContext<'_>,
   lang: &str,
   code: &str,
-) {
-  let mut label = ParagraphBuilder::for_block(ParagraphKind::Normal, 0, None);
-  label.style.bold += 1;
-  label.push_text(if lang.is_empty() { "code" } else { lang });
-  label.flush_to(out, table);
+) -> Result<()> {
+  let lines = docx.highlighter.lines(lang, code)?;
+  let last = lines.len().saturating_sub(1);
 
-  for line in code.lines() {
-    let mut paragraph = ParagraphBuilder::for_block(ParagraphKind::Code, 0, None);
-    paragraph.push_text(line);
-    paragraph.flush_to(out, table);
+  if let Some(table) = table {
+    for (index, line) in lines.into_iter().enumerate() {
+      table.push_paragraph(code_paragraph(
+        line,
+        &docx.highlighter.background,
+        index == last,
+      ));
+    }
+  } else {
+    out.extend(lines.into_iter().enumerate().map(|(index, line)| {
+      BodyChoice::WP(Box::new(code_paragraph(
+        line,
+        &docx.highlighter.background,
+        index == last,
+      )))
+    }));
+  }
+  Ok(())
+}
+
+fn code_paragraph(line: Vec<CodeRun>, background: &str, last: bool) -> Paragraph {
+  let runs = if line.is_empty() {
+    vec![ParagraphChoice::WR(Box::new(code_text_run(
+      "",
+      CodeRunStyle::default(),
+    )))]
+  } else {
+    line
+      .into_iter()
+      .map(|run| ParagraphChoice::WR(Box::new(code_text_run(&run.text, run.style))))
+      .collect()
+  };
+
+  let mut properties = block_properties(Some("NoSpacing"), ParagraphKind::Code, 0, None, None);
+  properties.shading = Some(fill_shading(background));
+  properties.indentation = Some(Indentation {
+    left: Some("200".to_string()),
+    right: Some("200".to_string()),
+    ..Default::default()
+  });
+  properties.spacing_between_lines = Some(SpacingBetweenLines {
+    before: Some("0".to_string()),
+    after: Some(if last { "160" } else { "0" }.to_string()),
+    line: Some("240".to_string()),
+    line_rule: Some(LineSpacingRuleValues::Auto),
+    ..Default::default()
+  });
+
+  Paragraph {
+    paragraph_properties: Some(Box::new(properties)),
+    paragraph_choice: runs,
+    ..Default::default()
+  }
+}
+
+fn code_text_run(text: &str, style: CodeRunStyle) -> Run {
+  Run {
+    run_properties: Some(Box::new(code_run_properties(style))),
+    run_choice: vec![RunChoice::WT(Box::new(Text {
+      space: Some(SpaceProcessingModeValues::Preserve),
+      xml_content: Some(text.to_string()),
+      ..Default::default()
+    }))],
+    ..Default::default()
+  }
+}
+
+fn code_run_properties(style: CodeRunStyle) -> RunProperties {
+  RunProperties {
+    bold: style.bold.then(Bold::default),
+    italic: style.italic.then(Italic::default),
+    underline: style.underline.then(|| Underline {
+      val: Some(UnderlineValues::Single),
+      ..Default::default()
+    }),
+    color: style.color.map(|color| Color {
+      val: color,
+      ..Default::default()
+    }),
+    run_fonts: Some(RunFonts {
+      ascii: Some("Consolas".to_string()),
+      high_ansi: Some("Consolas".to_string()),
+      east_asia: Some("Consolas".to_string()),
+      complex_script: Some("Consolas".to_string()),
+      ..Default::default()
+    }),
+    ..Default::default()
   }
 }
 
@@ -798,16 +1015,36 @@ fn heading_paragraph_with_bookmark(
   }
 }
 
-fn title_paragraph(text: &str) -> Paragraph {
+fn cover_title_paragraph(text: &str) -> Paragraph {
+  let mut properties = paragraph_properties("Title");
+  properties.justification = Some(Justification {
+    val: JustificationValues::Center,
+  });
+  properties.spacing_between_lines = Some(SpacingBetweenLines {
+    before: Some("3600".to_string()),
+    after: Some("0".to_string()),
+    ..Default::default()
+  });
+
   Paragraph {
-    paragraph_properties: Some(Box::new(paragraph_properties("Title"))),
-    paragraph_choice: vec![ParagraphChoice::WR(Box::new(text_run(
-      text,
-      RunStyle {
-        bold: true,
+    paragraph_properties: Some(Box::new(properties)),
+    paragraph_choice: vec![ParagraphChoice::WR(Box::new(Run {
+      run_properties: Some(Box::new(RunProperties {
+        bold: Some(Bold::default()),
+        font_size: Some(FontSize {
+          val: "68".to_string(),
+        }),
+        font_size_complex_script: Some(FontSizeComplexScript {
+          val: "68".to_string(),
+        }),
         ..Default::default()
-      },
-    )))],
+      })),
+      run_choice: vec![RunChoice::WT(Box::new(Text {
+        xml_content: Some(text.to_string()),
+        ..Default::default()
+      }))],
+      ..Default::default()
+    }))],
     ..Default::default()
   }
 }
@@ -1047,7 +1284,7 @@ fn normalize_path(path: &Path) -> PathBuf {
   out
 }
 
-fn numbering_definitions() -> Numbering {
+fn numbering_definitions(ordered_lists: &[OrderedListDefinition]) -> Numbering {
   Numbering {
     xmlns: vec![XmlNamespaceDecl::new(
       "w",
@@ -1059,12 +1296,14 @@ fn numbering_definitions() -> Numbering {
       abstract_numbering(3, NumberFormatValues::Bullet, "[x]"),
       abstract_numbering(4, NumberFormatValues::Bullet, "[ ]"),
     ],
-    w_num: vec![
+    w_num: [
       numbering_instance(BULLET_NUM_ID, 1),
-      numbering_instance(ORDERED_NUM_ID, 2),
       numbering_instance(TASK_DONE_NUM_ID, 3),
       numbering_instance(TASK_TODO_NUM_ID, 4),
-    ],
+    ]
+    .into_iter()
+    .chain(ordered_lists.iter().map(ordered_numbering_instance))
+    .collect(),
     ..Default::default()
   }
 }
@@ -1127,6 +1366,21 @@ fn numbering_instance(number_id: i32, abstract_id: i32) -> NumberingInstance {
   }
 }
 
+fn ordered_numbering_instance(definition: &OrderedListDefinition) -> NumberingInstance {
+  NumberingInstance {
+    number_id: definition.number_id,
+    abstract_num_id: Box::new(AbstractNumId { val: 2 }),
+    w_lvl_override: vec![LevelOverride {
+      level_index: definition.level.min(8) as i32,
+      start_override_numbering_value: Some(StartOverrideNumberingValue {
+        val: definition.start.min(i32::MAX as u64) as i32,
+      }),
+      ..Default::default()
+    }],
+    ..Default::default()
+  }
+}
+
 fn block_properties(
   style: Option<&str>,
   kind: ParagraphKind,
@@ -1174,6 +1428,7 @@ fn text_run(text: &str, style: RunStyle) -> Run {
   Run {
     run_properties: run_properties(style).map(Box::new),
     run_choice: vec![RunChoice::WT(Box::new(Text {
+      space: text_needs_preserve(text).then_some(SpaceProcessingModeValues::Preserve),
       xml_content: Some(text.to_string()),
       ..Default::default()
     }))],
@@ -1211,24 +1466,101 @@ fn run_properties(style: RunStyle) -> Option<RunProperties> {
       complex_script: Some("Consolas".to_string()),
       ..Default::default()
     }),
+    shading: style.code.then(|| fill_shading("F6F8FA")),
     ..Default::default()
   })
 }
 
 fn code_shading() -> Shading {
-  Shading {
-    val: ShadingPatternValues::Clear,
-    fill: Some("F6F8FA".to_string()),
+  fill_shading("F6F8FA")
+}
+
+fn table_shading() -> Shading {
+  fill_shading("EDEFF3")
+}
+
+fn table_borders() -> TableBorders {
+  TableBorders {
+    top_border: Some(TopBorder {
+      val: BorderValues::Single,
+      color: Some("D0D7DE".to_string()),
+      size: Some(4),
+      ..Default::default()
+    }),
+    left_border: Some(LeftBorder {
+      val: BorderValues::Single,
+      color: Some("D0D7DE".to_string()),
+      size: Some(4),
+      ..Default::default()
+    }),
+    bottom_border: Some(BottomBorder {
+      val: BorderValues::Single,
+      color: Some("D0D7DE".to_string()),
+      size: Some(4),
+      ..Default::default()
+    }),
+    right_border: Some(RightBorder {
+      val: BorderValues::Single,
+      color: Some("D0D7DE".to_string()),
+      size: Some(4),
+      ..Default::default()
+    }),
+    inside_horizontal_border: Some(InsideHorizontalBorder {
+      val: BorderValues::Single,
+      color: Some("D0D7DE".to_string()),
+      size: Some(4),
+      ..Default::default()
+    }),
+    inside_vertical_border: Some(InsideVerticalBorder {
+      val: BorderValues::Single,
+      color: Some("D0D7DE".to_string()),
+      size: Some(4),
+      ..Default::default()
+    }),
     ..Default::default()
   }
 }
 
-fn table_shading() -> Shading {
+fn fill_shading(fill: &str) -> Shading {
   Shading {
     val: ShadingPatternValues::Clear,
-    fill: Some("EDEFF3".to_string()),
+    color: Some("auto".to_string()),
+    fill: Some(fill.to_string()),
     ..Default::default()
   }
+}
+
+fn plain_code_lines(code: &str) -> Vec<Vec<CodeRun>> {
+  code_lines(code)
+    .into_iter()
+    .map(|line| {
+      vec![CodeRun {
+        text: line.to_string(),
+        style: CodeRunStyle::default(),
+      }]
+    })
+    .collect()
+}
+
+fn code_lines(code: &str) -> Vec<&str> {
+  let mut lines = code.split('\n').collect::<Vec<_>>();
+  if lines.last().is_some_and(|line| line.is_empty()) {
+    lines.pop();
+  }
+  if lines.is_empty() {
+    lines.push("");
+  }
+  lines
+}
+
+fn color_to_hex(color: SyntectColor) -> String {
+  format!("{:02X}{:02X}{:02X}", color.r, color.g, color.b)
+}
+
+fn text_needs_preserve(text: &str) -> bool {
+  text.starts_with(char::is_whitespace)
+    || text.ends_with(char::is_whitespace)
+    || text.contains("  ")
 }
 
 fn heading_level(level: HeadingLevel) -> usize {
