@@ -1,4 +1,5 @@
 mod docx;
+mod epub;
 mod pdf;
 
 use std::io;
@@ -23,6 +24,7 @@ fn main() -> Result<()> {
     },
     Some(("render-pdf", _)) => run_backend(PdfBackend),
     Some(("render-docx", _)) => run_backend(DocxBackend),
+    Some(("render-epub", _)) => run_backend(EpubBackend),
     _ => unreachable!("subcommand is required by clap"),
   }
 }
@@ -43,11 +45,12 @@ fn cli() -> Command {
     )
     .subcommand(Command::new("render-pdf").about("Run the mdBook PDF backend"))
     .subcommand(Command::new("render-docx").about("Run the mdBook DOCX backend"))
+    .subcommand(Command::new("render-epub").about("Run the mdBook EPUB backend"))
 }
 
 fn run_preprocessor_supports(renderer: &str) -> Result<()> {
   match renderer {
-    "pdf" | "docx" | "render-pdf" | "render-docx" => Ok(()),
+    "pdf" | "docx" | "epub" | "render-pdf" | "render-docx" | "render-epub" => Ok(()),
     _ => std::process::exit(1),
   }
 }
@@ -90,5 +93,17 @@ impl Renderer for DocxBackend {
 
   fn render(&self, ctx: &RenderContext) -> mdbook_renderer::errors::Result<()> {
     docx::render(ctx)
+  }
+}
+
+struct EpubBackend;
+
+impl Renderer for EpubBackend {
+  fn name(&self) -> &str {
+    "epub"
+  }
+
+  fn render(&self, ctx: &RenderContext) -> mdbook_renderer::errors::Result<()> {
+    epub::render(ctx)
   }
 }
