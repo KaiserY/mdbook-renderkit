@@ -17,6 +17,12 @@ command = "mdbook-renderkit render-pdf"
 
 [output.docx]
 command = "mdbook-renderkit render-docx"
+# Optional, use mdBook's chapter numbers for DOCX heading levels.
+# section-number = false
+# Optional, insert a Word TOC field after the title.
+# toc = true
+# Optional, TOC heading depth.
+# toc-depth = 3
 ```
 
 PDF templates can use these placeholders:
