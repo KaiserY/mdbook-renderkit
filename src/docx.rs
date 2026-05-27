@@ -11,23 +11,26 @@ use ooxmlsdk::parts::numbering_definitions_part::NumberingDefinitionsPart;
 use ooxmlsdk::parts::wordprocessing_document::WordprocessingDocument;
 use ooxmlsdk::schemas::opc_relationships::TargetMode;
 use ooxmlsdk::schemas::schemas_openxmlformats_org_wordprocessingml_2006_main::{
-  AbstractNum, AbstractNumId, Body, BodyChoice, Bold, BookmarkEnd, BookmarkStart, BorderValues,
+  AbstractNum, AbstractNumId, Body, BodyChoice, BookmarkEnd, BookmarkStart, BorderValues,
   BottomBorder, Break, BreakValues, Color, Document, FieldChar, FieldCharValues, FieldCode,
   FontSize, FontSizeComplexScript, Hyperlink, HyperlinkChoice, Indentation, InsideHorizontalBorder,
-  InsideVerticalBorder, Italic, Justification, JustificationValues, LeftBorder, Level,
-  LevelJustification, LevelJustificationValues, LevelOverride, LevelSuffix, LevelSuffixValues,
-  LevelText, LineSpacingRuleValues, MultiLevelType, MultiLevelValues, NumberFormatValues,
-  Numbering, NumberingFormat, NumberingId, NumberingInstance, NumberingLevelReference,
-  NumberingProperties, Paragraph, ParagraphChoice, ParagraphChoice2, ParagraphProperties,
-  ParagraphStyleId, RightBorder, Run, RunChoice, RunFonts, RunProperties, RunStyle as WordRunStyle,
-  Shading, ShadingPatternValues, SpacingBetweenLines, StartNumberingValue,
-  StartOverrideNumberingValue, Strike, TabStop, TabStopLeaderCharValues, TabStopValues, Table,
-  TableBorders, TableCell, TableCellChoice, TableCellProperties, TableCellWidth, TableChoice2,
-  TableProperties, TableRow, TableRowChoice, TableStyle, TableWidth, TableWidthUnitValues, Tabs,
-  Text, TopBorder, Underline, UnderlineValues,
+  InsideVerticalBorder, Justification, JustificationValues, LeftBorder, Level, LevelJustification,
+  LevelJustificationValues, LevelOverride, LevelSuffix, LevelSuffixValues, LevelText,
+  LineSpacingRuleValues, MultiLevelType, MultiLevelValues, NumberFormatValues, Numbering,
+  NumberingFormat, NumberingId, NumberingInstance, NumberingLevelReference, NumberingProperties,
+  Paragraph, ParagraphChoice, ParagraphProperties, ParagraphStyleId, RightBorder, Run, RunChoice,
+  RunFonts, RunProperties, RunPropertiesChoice, RunStyle as WordRunStyle, Shading,
+  ShadingPatternValues, SpacingBetweenLines, StartNumberingValue, StartOverrideNumberingValue,
+  TabStop, TabStopLeaderCharValues, TabStopValues, Table, TableBorders, TableCell, TableCellChoice,
+  TableCellProperties, TableCellWidth, TableChoice2, TableProperties, TableRow, TableRowChoice,
+  TableStyle, TableWidth, TableWidthUnitValues, Tabs, Text, TextType, TopBorder, Underline,
+  UnderlineValues,
 };
 use ooxmlsdk::schemas::www_w3_org_xml_1998_namespace::SpaceProcessingModeValues;
 use ooxmlsdk::sdk::WordprocessingDocumentType;
+use ooxmlsdk::simple_type::{
+  MeasurementOrPercentValue, OnOffValue, SignedTwipsMeasureValue, TwipsMeasureValue,
+};
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SyntectColor, FontStyle as SyntectFontStyle, Style, Theme};
@@ -37,6 +40,34 @@ const BULLET_NUM_ID: i32 = 1;
 const TASK_DONE_NUM_ID: i32 = 3;
 const TASK_TODO_NUM_ID: i32 = 4;
 const FIRST_ORDERED_NUM_ID: i32 = 10;
+
+fn text_node(text: &str, preserve_space: bool) -> Text {
+  Text(TextType {
+    space: preserve_space.then_some(SpaceProcessingModeValues::Preserve),
+    xml_content: Some(text.to_string()),
+    ..Default::default()
+  })
+}
+
+fn field_code_node(text: &str) -> FieldCode {
+  FieldCode(TextType {
+    xml_content: Some(text.to_string()),
+    ..Default::default()
+  })
+}
+
+fn pct(value: i64) -> MeasurementOrPercentValue {
+  MeasurementOrPercentValue::from_bytes(value.to_string().as_bytes())
+    .expect("static measurement value is valid")
+}
+
+fn twips(value: u64) -> TwipsMeasureValue {
+  TwipsMeasureValue::Twips(value)
+}
+
+fn signed_twips(value: i64) -> SignedTwipsMeasureValue {
+  SignedTwipsMeasureValue::Twips(value)
+}
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -129,10 +160,12 @@ fn document(
   if let Some(title) = &ctx.config.book.title {
     body
       .body_choice
-      .push(BodyChoice::WP(Box::new(cover_title_paragraph(title))));
+      .push(BodyChoice::Paragraph(Box::new(cover_title_paragraph(
+        title,
+      ))));
     body
       .body_choice
-      .push(BodyChoice::WP(Box::new(page_break_paragraph())));
+      .push(BodyChoice::Paragraph(Box::new(page_break_paragraph())));
   }
 
   if cfg.toc {
@@ -145,18 +178,14 @@ fn document(
     body.body_choice.extend(chapter_body(cfg, docx, chapter)?);
     if body.body_choice.len() == before {
       let bookmark = docx.chapter_bookmark(chapter);
-      body
-        .body_choice
-        .push(BodyChoice::WP(Box::new(heading_paragraph_with_bookmark(
-          chapter_level(chapter),
-          &chapter.name,
-          bookmark,
-        ))));
+      body.body_choice.push(BodyChoice::Paragraph(Box::new(
+        heading_paragraph_with_bookmark(chapter_level(chapter), &chapter.name, bookmark),
+      )));
     }
     if chapters.peek().is_some() {
       body
         .body_choice
-        .push(BodyChoice::WP(Box::new(page_break_paragraph())));
+        .push(BodyChoice::Paragraph(Box::new(page_break_paragraph())));
     }
   }
 
@@ -284,7 +313,7 @@ fn chapter_body(
       }
       Event::End(TagEnd::Table) => {
         if let Some(table) = table.take() {
-          out.push(BodyChoice::WTbl(Box::new(table.into_table())));
+          out.push(BodyChoice::Table(Box::new(table.into_table())));
         }
       }
       Event::Start(Tag::TableHead) => {
@@ -346,7 +375,7 @@ fn chapter_body(
       Event::SoftBreak | Event::HardBreak => paragraph.push_text("\n"),
       Event::Rule => {
         paragraph.flush_to(&mut out, &mut table);
-        out.push(BodyChoice::WP(Box::new(paragraph_from_text(
+        out.push(BodyChoice::Paragraph(Box::new(paragraph_from_text(
           "----------------------------------------",
           RunStyle::default(),
         ))));
@@ -678,8 +707,8 @@ impl ParagraphBuilder {
 
     for (index, line) in text.split('\n').enumerate() {
       if index > 0 {
-        self.runs.push(ParagraphChoice::WR(Box::new(Run {
-          run_choice: vec![RunChoice::WBr(Box::default())],
+        self.runs.push(ParagraphChoice::WRun(Box::new(Run {
+          run_choice: vec![RunChoice::Break(Box::default())],
           ..Default::default()
         })));
       }
@@ -694,9 +723,9 @@ impl ParagraphBuilder {
     if let Some(link) = self.link_stack.last() {
       self
         .runs
-        .push(ParagraphChoice::WHyperlink(Box::new(hyperlink(link, run))));
+        .push(ParagraphChoice::Hyperlink(Box::new(hyperlink(link, run))));
     } else {
-      self.runs.push(ParagraphChoice::WR(Box::new(run)));
+      self.runs.push(ParagraphChoice::WRun(Box::new(run)));
     }
   }
 
@@ -707,20 +736,16 @@ impl ParagraphBuilder {
 
     let mut paragraph_choice = Vec::new();
     if let Some(bookmark) = self.bookmark.take() {
-      paragraph_choice.push(ParagraphChoice::Choice(Box::new(
-        ParagraphChoice2::WBookmarkStart(Box::new(BookmarkStart {
-          name: bookmark.name,
-          id: bookmark.id.clone(),
-          ..Default::default()
-        })),
-      )));
+      paragraph_choice.push(ParagraphChoice::BookmarkStart(Box::new(BookmarkStart {
+        name: bookmark.name,
+        id: bookmark.id.clone(),
+        ..Default::default()
+      })));
       paragraph_choice.append(&mut self.runs);
-      paragraph_choice.push(ParagraphChoice::Choice(Box::new(
-        ParagraphChoice2::WBookmarkEnd(Box::new(BookmarkEnd {
-          id: bookmark.id,
-          ..Default::default()
-        })),
-      )));
+      paragraph_choice.push(ParagraphChoice::BookmarkEnd(Box::new(BookmarkEnd {
+        id: bookmark.id,
+        ..Default::default()
+      })));
     } else {
       paragraph_choice.append(&mut self.runs);
     }
@@ -809,30 +834,30 @@ impl TableBuilder {
     let cell_width = (8640 / column_count).max(720);
 
     Table {
-      w_tbl_pr: Some(Box::new(TableProperties {
+      table_properties: Box::new(TableProperties {
         table_style: Some(TableStyle {
           val: "TableGrid".to_string(),
         }),
         table_width: Some(TableWidth {
-          width: Some("5000".to_string()),
+          width: Some(pct(5000)),
           r#type: Some(TableWidthUnitValues::Pct),
         }),
         table_borders: Some(Box::new(table_borders())),
         ..Default::default()
-      })),
+      }),
       table_choice2: self
         .rows
         .into_iter()
         .map(|row| {
-          TableChoice2::WTr(Box::new(TableRow {
+          TableChoice2::TableRow(Box::new(TableRow {
             table_row_choice: row
               .cells
               .into_iter()
               .map(|cell| {
-                TableRowChoice::WTc(Box::new(TableCell {
+                TableRowChoice::TableCell(Box::new(TableCell {
                   table_cell_properties: Some(Box::new(TableCellProperties {
                     table_cell_width: Some(TableCellWidth {
-                      width: Some(cell_width.to_string()),
+                      width: Some(pct(cell_width as i64)),
                       r#type: Some(TableWidthUnitValues::Dxa),
                     }),
                     shading: (cell.is_head || row.is_head).then(table_shading),
@@ -841,7 +866,7 @@ impl TableBuilder {
                   table_cell_choice: cell
                     .paragraphs
                     .into_iter()
-                    .map(|paragraph| TableCellChoice::WP(Box::new(paragraph)))
+                    .map(|paragraph| TableCellChoice::Paragraph(Box::new(paragraph)))
                     .collect(),
                   ..Default::default()
                 }))
@@ -864,7 +889,7 @@ fn push_paragraph(
   if let Some(table) = table {
     table.push_paragraph(paragraph);
   } else {
-    out.push(BodyChoice::WP(Box::new(paragraph)));
+    out.push(BodyChoice::Paragraph(Box::new(paragraph)));
   }
 }
 
@@ -888,7 +913,7 @@ fn push_code_block(
     }
   } else {
     out.extend(lines.into_iter().enumerate().map(|(index, line)| {
-      BodyChoice::WP(Box::new(code_paragraph(
+      BodyChoice::Paragraph(Box::new(code_paragraph(
         line,
         &docx.highlighter.background,
         index == last,
@@ -900,28 +925,28 @@ fn push_code_block(
 
 fn code_paragraph(line: Vec<CodeRun>, background: &str, last: bool) -> Paragraph {
   let runs = if line.is_empty() {
-    vec![ParagraphChoice::WR(Box::new(code_text_run(
+    vec![ParagraphChoice::WRun(Box::new(code_text_run(
       "",
       CodeRunStyle::default(),
     )))]
   } else {
     line
       .into_iter()
-      .map(|run| ParagraphChoice::WR(Box::new(code_text_run(&run.text, run.style))))
+      .map(|run| ParagraphChoice::WRun(Box::new(code_text_run(&run.text, run.style))))
       .collect()
   };
 
   let mut properties = block_properties(Some("NoSpacing"), ParagraphKind::Code, 0, None, None);
   properties.shading = Some(fill_shading(background));
   properties.indentation = Some(Indentation {
-    left: Some("200".to_string()),
-    right: Some("200".to_string()),
+    left: Some(signed_twips(200)),
+    right: Some(signed_twips(200)),
     ..Default::default()
   });
   properties.spacing_between_lines = Some(SpacingBetweenLines {
-    before: Some("0".to_string()),
-    after: Some(if last { "160" } else { "0" }.to_string()),
-    line: Some("240".to_string()),
+    before: Some(twips(0)),
+    after: Some(twips(if last { 160 } else { 0 })),
+    line: Some(signed_twips(240)),
     line_rule: Some(LineSpacingRuleValues::Auto),
     ..Default::default()
   });
@@ -936,34 +961,35 @@ fn code_paragraph(line: Vec<CodeRun>, background: &str, last: bool) -> Paragraph
 fn code_text_run(text: &str, style: CodeRunStyle) -> Run {
   Run {
     run_properties: Some(Box::new(code_run_properties(style))),
-    run_choice: vec![RunChoice::WT(Box::new(Text {
-      space: Some(SpaceProcessingModeValues::Preserve),
-      xml_content: Some(text.to_string()),
-      ..Default::default()
-    }))],
+    run_choice: vec![RunChoice::Text(Box::new(text_node(text, true)))],
     ..Default::default()
   }
 }
 
 fn code_run_properties(style: CodeRunStyle) -> RunProperties {
-  RunProperties {
-    bold: style.bold.then(Bold::default),
-    italic: style.italic.then(Italic::default),
-    underline: style.underline.then(|| Underline {
+  let mut choices = Vec::new();
+  if style.bold {
+    choices.push(RunPropertiesChoice::Bold(Box::default()));
+  }
+  if style.italic {
+    choices.push(RunPropertiesChoice::Italic(Box::default()));
+  }
+  if style.underline {
+    choices.push(RunPropertiesChoice::Underline(Box::new(Underline {
       val: Some(UnderlineValues::Single),
       ..Default::default()
-    }),
-    color: style.color.map(|color| Color {
+    })));
+  }
+  if let Some(color) = style.color {
+    choices.push(RunPropertiesChoice::Color(Box::new(Color {
       val: color,
       ..Default::default()
-    }),
-    run_fonts: Some(RunFonts {
-      ascii: Some("Consolas".to_string()),
-      high_ansi: Some("Consolas".to_string()),
-      east_asia: Some("Consolas".to_string()),
-      complex_script: Some("Consolas".to_string()),
-      ..Default::default()
-    }),
+    })));
+  }
+  choices.push(RunPropertiesChoice::RunFonts(Box::new(consolas_fonts())));
+
+  RunProperties {
+    run_properties_choice: choices,
     ..Default::default()
   }
 }
@@ -975,28 +1001,24 @@ fn heading_paragraph_with_bookmark(
 ) -> Paragraph {
   let mut paragraph_choice = Vec::new();
   if let Some(bookmark) = bookmark {
-    paragraph_choice.push(ParagraphChoice::Choice(Box::new(
-      ParagraphChoice2::WBookmarkStart(Box::new(BookmarkStart {
-        name: bookmark.name,
-        id: bookmark.id.clone(),
-        ..Default::default()
-      })),
-    )));
-    paragraph_choice.push(ParagraphChoice::WR(Box::new(text_run(
+    paragraph_choice.push(ParagraphChoice::BookmarkStart(Box::new(BookmarkStart {
+      name: bookmark.name,
+      id: bookmark.id.clone(),
+      ..Default::default()
+    })));
+    paragraph_choice.push(ParagraphChoice::WRun(Box::new(text_run(
       text,
       RunStyle {
         bold: true,
         ..Default::default()
       },
     ))));
-    paragraph_choice.push(ParagraphChoice::Choice(Box::new(
-      ParagraphChoice2::WBookmarkEnd(Box::new(BookmarkEnd {
-        id: bookmark.id,
-        ..Default::default()
-      })),
-    )));
+    paragraph_choice.push(ParagraphChoice::BookmarkEnd(Box::new(BookmarkEnd {
+      id: bookmark.id,
+      ..Default::default()
+    })));
   } else {
-    paragraph_choice.push(ParagraphChoice::WR(Box::new(text_run(
+    paragraph_choice.push(ParagraphChoice::WRun(Box::new(text_run(
       text,
       RunStyle {
         bold: true,
@@ -1021,28 +1043,27 @@ fn cover_title_paragraph(text: &str) -> Paragraph {
     val: JustificationValues::Center,
   });
   properties.spacing_between_lines = Some(SpacingBetweenLines {
-    before: Some("3600".to_string()),
-    after: Some("0".to_string()),
+    before: Some(twips(3600)),
+    after: Some(twips(0)),
     ..Default::default()
   });
 
   Paragraph {
     paragraph_properties: Some(Box::new(properties)),
-    paragraph_choice: vec![ParagraphChoice::WR(Box::new(Run {
+    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(Run {
       run_properties: Some(Box::new(RunProperties {
-        bold: Some(Bold::default()),
-        font_size: Some(FontSize {
-          val: "68".to_string(),
-        }),
-        font_size_complex_script: Some(FontSizeComplexScript {
-          val: "68".to_string(),
-        }),
+        run_properties_choice: vec![
+          RunPropertiesChoice::Bold(Box::default()),
+          RunPropertiesChoice::FontSize(Box::new(FontSize {
+            val: "68".to_string(),
+          })),
+          RunPropertiesChoice::FontSizeComplexScript(Box::new(FontSizeComplexScript {
+            val: "68".to_string(),
+          })),
+        ],
         ..Default::default()
       })),
-      run_choice: vec![RunChoice::WT(Box::new(Text {
-        xml_content: Some(text.to_string()),
-        ..Default::default()
-      }))],
+      run_choice: vec![RunChoice::Text(Box::new(text_node(text, false)))],
       ..Default::default()
     }))],
     ..Default::default()
@@ -1052,7 +1073,7 @@ fn cover_title_paragraph(text: &str) -> Paragraph {
 fn toc_heading_paragraph(text: &str) -> Paragraph {
   Paragraph {
     paragraph_properties: Some(Box::new(paragraph_properties("TOCHeading"))),
-    paragraph_choice: vec![ParagraphChoice::WR(Box::new(text_run(
+    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(text_run(
       text,
       RunStyle {
         bold: true,
@@ -1065,7 +1086,7 @@ fn toc_heading_paragraph(text: &str) -> Paragraph {
 
 fn paragraph_from_text(text: &str, style: RunStyle) -> Paragraph {
   Paragraph {
-    paragraph_choice: vec![ParagraphChoice::WR(Box::new(text_run(text, style)))],
+    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(text_run(text, style)))],
     ..Default::default()
   }
 }
@@ -1085,15 +1106,15 @@ fn toc_block(
   docx: &mut DocxRenderContext<'_>,
 ) -> Vec<BodyChoice> {
   let mut out = vec![
-    BodyChoice::WP(Box::new(toc_heading_paragraph("Contents"))),
-    BodyChoice::WP(Box::new(Paragraph {
+    BodyChoice::Paragraph(Box::new(toc_heading_paragraph("Contents"))),
+    BodyChoice::Paragraph(Box::new(Paragraph {
       paragraph_choice: vec![
-        ParagraphChoice::WR(Box::new(field_char_run(FieldCharValues::Begin, true))),
-        ParagraphChoice::WR(Box::new(field_code_run(&format!(
+        ParagraphChoice::WRun(Box::new(field_char_run(FieldCharValues::Begin, true))),
+        ParagraphChoice::WRun(Box::new(field_code_run(&format!(
           r#" TOC \o "1-{}" \h \z \u "#,
           cfg.toc_depth()
         )))),
-        ParagraphChoice::WR(Box::new(field_char_run(FieldCharValues::Separate, false))),
+        ParagraphChoice::WRun(Box::new(field_char_run(FieldCharValues::Separate, false))),
       ],
       ..Default::default()
     })),
@@ -1105,18 +1126,18 @@ fn toc_block(
     .filter(|chapter| chapter_level(chapter) <= cfg.toc_depth())
   {
     if let Some(paragraph) = toc_entry_paragraph(cfg, docx, chapter) {
-      out.push(BodyChoice::WP(Box::new(paragraph)));
+      out.push(BodyChoice::Paragraph(Box::new(paragraph)));
     }
   }
 
-  out.push(BodyChoice::WP(Box::new(Paragraph {
-    paragraph_choice: vec![ParagraphChoice::WR(Box::new(field_char_run(
+  out.push(BodyChoice::Paragraph(Box::new(Paragraph {
+    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(field_char_run(
       FieldCharValues::End,
       false,
     )))],
     ..Default::default()
   })));
-  out.push(BodyChoice::WP(Box::new(page_break_paragraph())));
+  out.push(BodyChoice::Paragraph(Box::new(page_break_paragraph())));
   out
 }
 
@@ -1141,18 +1162,18 @@ fn toc_entry_paragraph(
 
   Some(Paragraph {
     paragraph_properties: Some(Box::new(toc_entry_properties(level))),
-    paragraph_choice: vec![ParagraphChoice::WHyperlink(Box::new(Hyperlink {
+    paragraph_choice: vec![ParagraphChoice::Hyperlink(Box::new(Hyperlink {
       anchor: Some(bookmark),
-      history: Some(true),
+      history: Some(OnOffValue::True),
       hyperlink_choice: vec![
-        HyperlinkChoice::WR(Box::new(text_run(
+        HyperlinkChoice::WRun(Box::new(text_run(
           &title,
           RunStyle {
             hyperlink: true,
             ..Default::default()
           },
         ))),
-        HyperlinkChoice::WR(Box::new(tab_run())),
+        HyperlinkChoice::WRun(Box::new(tab_run())),
       ],
       ..Default::default()
     }))],
@@ -1163,14 +1184,14 @@ fn toc_entry_paragraph(
 fn toc_entry_properties(level: usize) -> ParagraphProperties {
   let mut properties = paragraph_properties(&format!("TOC{}", level.clamp(1, 9)));
   properties.indentation = Some(Indentation {
-    left: Some(((level.saturating_sub(1)) * 420).to_string()),
+    left: Some(signed_twips(((level.saturating_sub(1)) * 420) as i64)),
     ..Default::default()
   });
   properties.tabs = Some(Tabs {
-    w_tab: vec![TabStop {
+    tab_stop: vec![TabStop {
       val: TabStopValues::Right,
       leader: Some(TabStopLeaderCharValues::Dot),
-      position: 9000,
+      position: signed_twips(9000),
     }],
   });
   properties
@@ -1178,9 +1199,9 @@ fn toc_entry_properties(level: usize) -> ParagraphProperties {
 
 fn field_char_run(field_char_type: FieldCharValues, dirty: bool) -> Run {
   Run {
-    run_choice: vec![RunChoice::WFldChar(Box::new(FieldChar {
+    run_choice: vec![RunChoice::FieldChar(Box::new(FieldChar {
       field_char_type,
-      dirty: dirty.then_some(true),
+      dirty: dirty.then_some(OnOffValue::True),
       ..Default::default()
     }))],
     ..Default::default()
@@ -1189,18 +1210,15 @@ fn field_char_run(field_char_type: FieldCharValues, dirty: bool) -> Run {
 
 fn field_code_run(instruction: &str) -> Run {
   Run {
-    run_choice: vec![RunChoice::WInstrText(Box::new(FieldCode {
-      xml_content: Some(instruction.to_string()),
-      ..Default::default()
-    }))],
+    run_choice: vec![RunChoice::FieldCode(Box::new(field_code_node(instruction)))],
     ..Default::default()
   }
 }
 
 fn page_break_paragraph() -> Paragraph {
   Paragraph {
-    paragraph_choice: vec![ParagraphChoice::WR(Box::new(Run {
-      run_choice: vec![RunChoice::WBr(Box::new(Break {
+    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(Run {
+      run_choice: vec![RunChoice::Break(Box::new(Break {
         r#type: Some(BreakValues::Page),
         ..Default::default()
       }))],
@@ -1214,14 +1232,14 @@ fn hyperlink(target: &LinkTarget, run: Run) -> Hyperlink {
   match target {
     LinkTarget::External(id) => Hyperlink {
       id: Some(id.clone()),
-      history: Some(true),
-      hyperlink_choice: vec![HyperlinkChoice::WR(Box::new(run))],
+      history: Some(OnOffValue::True),
+      hyperlink_choice: vec![HyperlinkChoice::WRun(Box::new(run))],
       ..Default::default()
     },
     LinkTarget::Anchor(anchor) => Hyperlink {
       anchor: Some(anchor.clone()),
-      history: Some(true),
-      hyperlink_choice: vec![HyperlinkChoice::WR(Box::new(run))],
+      history: Some(OnOffValue::True),
+      hyperlink_choice: vec![HyperlinkChoice::WRun(Box::new(run))],
       ..Default::default()
     },
   }
@@ -1290,13 +1308,13 @@ fn numbering_definitions(ordered_lists: &[OrderedListDefinition]) -> Numbering {
       "w",
       "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
     )],
-    w_abstract_num: vec![
+    abstract_num: vec![
       abstract_numbering(1, NumberFormatValues::Bullet, "-"),
       abstract_numbering(2, NumberFormatValues::Decimal, "%1."),
       abstract_numbering(3, NumberFormatValues::Bullet, "[x]"),
       abstract_numbering(4, NumberFormatValues::Bullet, "[ ]"),
     ],
-    w_num: [
+    numbering_instance: [
       numbering_instance(BULLET_NUM_ID, 1),
       numbering_instance(TASK_DONE_NUM_ID, 3),
       numbering_instance(TASK_TODO_NUM_ID, 4),
@@ -1314,7 +1332,7 @@ fn abstract_numbering(id: i32, format: NumberFormatValues, text: &str) -> Abstra
     multi_level_type: Some(MultiLevelType {
       val: MultiLevelValues::Multilevel,
     }),
-    w_lvl: (0..9)
+    level: (0..9)
       .map(|level| numbering_level(level, format, text))
       .collect(),
     ..Default::default()
@@ -1347,8 +1365,8 @@ fn numbering_level(level: i32, format: NumberFormatValues, text: &str) -> Level 
         previous_paragraph_properties: Some(Box::new(
             ooxmlsdk::schemas::schemas_openxmlformats_org_wordprocessingml_2006_main::PreviousParagraphProperties {
                 indentation: Some(Indentation {
-                    left: Some(((level as usize + 1) * 420).to_string()),
-                    hanging: Some("240".to_string()),
+                    left: Some(signed_twips(((level as usize + 1) * 420) as i64)),
+                    hanging: Some(twips(240)),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1370,7 +1388,7 @@ fn ordered_numbering_instance(definition: &OrderedListDefinition) -> NumberingIn
   NumberingInstance {
     number_id: definition.number_id,
     abstract_num_id: Box::new(AbstractNumId { val: 2 }),
-    w_lvl_override: vec![LevelOverride {
+    level_override: vec![LevelOverride {
       level_index: definition.level.min(8) as i32,
       start_override_numbering_value: Some(StartOverrideNumberingValue {
         val: definition.start.min(i32::MAX as u64) as i32,
@@ -1393,7 +1411,7 @@ fn block_properties(
   let indent_depth = list_depth.unwrap_or(0) + quote_depth;
   if indent_depth > 0 {
     properties.indentation = Some(Indentation {
-      left: Some((indent_depth * 420).to_string()),
+      left: Some(signed_twips((indent_depth * 420) as i64)),
       ..Default::default()
     });
   }
@@ -1427,18 +1445,17 @@ fn paragraph_style_for_kind(kind: ParagraphKind) -> Option<&'static str> {
 fn text_run(text: &str, style: RunStyle) -> Run {
   Run {
     run_properties: run_properties(style).map(Box::new),
-    run_choice: vec![RunChoice::WT(Box::new(Text {
-      space: text_needs_preserve(text).then_some(SpaceProcessingModeValues::Preserve),
-      xml_content: Some(text.to_string()),
-      ..Default::default()
-    }))],
+    run_choice: vec![RunChoice::Text(Box::new(text_node(
+      text,
+      text_needs_preserve(text),
+    )))],
     ..Default::default()
   }
 }
 
 fn tab_run() -> Run {
   Run {
-    run_choice: vec![RunChoice::WTab],
+    run_choice: vec![RunChoice::TabChar],
     ..Default::default()
   }
 }
@@ -1448,27 +1465,46 @@ fn run_properties(style: RunStyle) -> Option<RunProperties> {
     return None;
   }
 
-  Some(RunProperties {
-    bold: style.bold.then(Bold::default),
-    italic: style.italic.then(Italic::default),
-    strike: style.strike.then(Strike::default),
-    run_style: style.hyperlink.then(|| WordRunStyle {
+  let mut choices = Vec::new();
+  if style.bold {
+    choices.push(RunPropertiesChoice::Bold(Box::default()));
+  }
+  if style.italic {
+    choices.push(RunPropertiesChoice::Italic(Box::default()));
+  }
+  if style.strike {
+    choices.push(RunPropertiesChoice::Strike(Box::default()));
+  }
+  if style.hyperlink {
+    choices.push(RunPropertiesChoice::RunStyle(Box::new(WordRunStyle {
       val: "Hyperlink".to_string(),
-    }),
-    color: style.hyperlink.then(|| Color {
+    })));
+    choices.push(RunPropertiesChoice::Color(Box::new(Color {
       val: "0563C1".to_string(),
       ..Default::default()
-    }),
-    run_fonts: style.code.then(|| RunFonts {
-      ascii: Some("Consolas".to_string()),
-      high_ansi: Some("Consolas".to_string()),
-      east_asia: Some("Consolas".to_string()),
-      complex_script: Some("Consolas".to_string()),
-      ..Default::default()
-    }),
-    shading: style.code.then(|| fill_shading("F6F8FA")),
+    })));
+  }
+  if style.code {
+    choices.push(RunPropertiesChoice::RunFonts(Box::new(consolas_fonts())));
+    choices.push(RunPropertiesChoice::Shading(Box::new(fill_shading(
+      "F6F8FA",
+    ))));
+  }
+
+  Some(RunProperties {
+    run_properties_choice: choices,
     ..Default::default()
   })
+}
+
+fn consolas_fonts() -> RunFonts {
+  RunFonts {
+    ascii: Some("Consolas".to_string()),
+    high_ansi: Some("Consolas".to_string()),
+    east_asia: Some("Consolas".to_string()),
+    complex_script: Some("Consolas".to_string()),
+    ..Default::default()
+  }
 }
 
 fn code_shading() -> Shading {

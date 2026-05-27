@@ -161,6 +161,7 @@ fn markdown_to_typst(ctx: &RenderContext, cfg: &PdfConfig, chapter: &Chapter) ->
   );
 
   let chapter_ctx = ChapterContext::new(ctx, chapter);
+  let first_heading_level = first_markdown_heading_level(&chapter.content).unwrap_or(1);
   let mut output = String::new();
   let mut code_block: Option<(String, String)> = None;
   let mut admonish: Option<(String, String, String)> = None;
@@ -207,20 +208,25 @@ fn markdown_to_typst(ctx: &RenderContext, cfg: &PdfConfig, chapter: &Chapter) ->
       Event::Start(Tag::Heading { level, .. }) => {
         inline_stack.push(InlineState::Heading);
         heading.clear();
-        let level_usize = markdown_heading_level(cfg, chapter, level as usize);
+        let level_usize = markdown_heading_level(chapter, first_heading_level, level as usize);
         output.push_str("#heading(level: ");
         output.push_str(&level_usize.to_string());
+        if !cfg.section_number {
+          output.push_str(", numbering: none");
+        }
         output.push_str(", outlined: false, bookmarked: false");
         output.push_str(")[");
       }
       Event::End(TagEnd::Heading(level)) => {
         inline_stack.pop();
-        let level_usize = markdown_heading_level(cfg, chapter, level as usize);
+        let level_usize = markdown_heading_level(chapter, first_heading_level, level as usize);
         output.push_str("]\n");
 
         if !wrote_invisible_heading {
           render_invisible_chapter_heading(&mut output, cfg, chapter, &chapter_ctx, level_usize);
           wrote_invisible_heading = true;
+        } else {
+          render_invisible_heading(&mut output, level_usize, &heading);
         }
 
         output.push('\n');
@@ -352,14 +358,32 @@ fn render_table_start(output: &mut String, align: &[Alignment]) {
   output.push_str("),\n");
 }
 
-fn markdown_heading_level(cfg: &PdfConfig, chapter: &Chapter, markdown_level: usize) -> usize {
-  if cfg.section_number
-    && let Some(number) = &chapter.number
-  {
-    return number.len().max(1) + markdown_level.saturating_sub(1);
-  }
+fn first_markdown_heading_level(markdown: &str) -> Option<usize> {
+  Parser::new_ext(
+    markdown,
+    Options::ENABLE_SMART_PUNCTUATION
+      | Options::ENABLE_TABLES
+      | Options::ENABLE_STRIKETHROUGH
+      | Options::ENABLE_TASKLISTS
+      | Options::ENABLE_FOOTNOTES,
+  )
+  .find_map(|event| match event {
+    Event::Start(Tag::Heading { level, .. }) => Some(level as usize),
+    _ => None,
+  })
+}
 
-  markdown_level
+fn markdown_heading_level(
+  chapter: &Chapter,
+  first_markdown_level: usize,
+  markdown_level: usize,
+) -> usize {
+  let chapter_depth = chapter
+    .number
+    .as_ref()
+    .map_or(1, |number| number.len().max(1));
+
+  (chapter_depth + markdown_level.saturating_sub(first_markdown_level)).clamp(1, 6)
 }
 
 fn render_invisible_chapter_heading(
@@ -395,6 +419,18 @@ fn render_invisible_chapter_heading(
 
   output.push_str(&ctx.label);
   output.push_str(">\n");
+}
+
+fn render_invisible_heading(output: &mut String, level: usize, text: &str) {
+  if text.trim().is_empty() {
+    return;
+  }
+
+  output.push_str("#{\n  show heading: none\n  heading(numbering: none, level: ");
+  output.push_str(&level.clamp(1, 6).to_string());
+  output.push_str(", outlined: true, bookmarked: true)[");
+  output.push_str(&escape_typst(text.trim()));
+  output.push_str("]\n}\n");
 }
 
 fn render_link_start(output: &mut String, ctx: &ChapterContext<'_>, dest_url: &str) {
