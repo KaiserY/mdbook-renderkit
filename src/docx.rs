@@ -5,7 +5,10 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result};
 use mdbook_renderer::RenderContext;
 use mdbook_renderer::book::Chapter;
-use ooxmlsdk::common::XmlNamespaceDecl;
+use ooxmlsdk::common::{XmlHeaderType, XmlNamespaceDecl};
+use ooxmlsdk::parts::document_settings_part::DocumentSettingsPart;
+use ooxmlsdk::parts::footer_part::FooterPart;
+use ooxmlsdk::parts::header_part::HeaderPart;
 use ooxmlsdk::parts::main_document_part::MainDocumentPart;
 use ooxmlsdk::parts::numbering_definitions_part::NumberingDefinitionsPart;
 use ooxmlsdk::parts::wordprocessing_document::WordprocessingDocument;
@@ -16,23 +19,26 @@ use ooxmlsdk::schemas::schemas_openxmlformats_org_drawingml_2006_wordprocessing_
 use ooxmlsdk::schemas::schemas_openxmlformats_org_wordprocessingml_2006_main::{
   AbstractNum, AbstractNumId, Body, BodyChoice, BookmarkEnd, BookmarkStart, BorderValues,
   BottomBorder, BottomMargin, Break, BreakValues, Color, Document, Drawing, DrawingChoice,
-  FieldChar, FieldCharValues, FieldCode, FontSize, FontSizeComplexScript, GridColumn,
-  HeightRuleValues, Hyperlink, HyperlinkChoice, Indentation, InsideHorizontalBorder,
-  InsideVerticalBorder, Justification, JustificationValues, LeftBorder, Level, LevelJustification,
+  FieldChar, FieldCharValues, FieldCode, FontSize, FontSizeComplexScript, Footer, FooterChoice,
+  FooterReference, GridColumn, Header, HeaderFooterValues, HeaderReference, HeightRuleValues,
+  Hyperlink, HyperlinkChoice, Indentation, InsideHorizontalBorder, InsideVerticalBorder,
+  Justification, JustificationValues, LeftBorder, Level, LevelJustification,
   LevelJustificationValues, LevelOverride, LevelSuffix, LevelSuffixValues, LevelText,
   LineSpacingRuleValues, MultiLevelType, MultiLevelValues, NumberFormatValues, Numbering,
   NumberingFormat, NumberingId, NumberingInstance, NumberingLevelReference, NumberingProperties,
-  Paragraph, ParagraphChoice, ParagraphProperties, ParagraphStyleId, RightBorder, Run, RunChoice,
-  RunFonts, RunProperties, RunPropertiesChoice, RunStyle as WordRunStyle, SectionProperties,
-  Shading, ShadingPatternValues, SpacingBetweenLines, StartNumberingValue,
-  StartOverrideNumberingValue, StyleValues, TabStop, TabStopLeaderCharValues, TabStopValues, Table,
+  Paragraph, ParagraphChoice, ParagraphMarkRunProperties, ParagraphMarkRunPropertiesChoice2,
+  ParagraphProperties, ParagraphStyleId, RightBorder, Run, RunChoice, RunFonts, RunProperties,
+  RunPropertiesChoice, RunStyle as WordRunStyle, SectionMarkValues, SectionProperties,
+  SectionPropertiesChoice, SectionType, Settings, Shading, ShadingPatternValues,
+  SpacingBetweenLines, StartNumberingValue, StartOverrideNumberingValue, Style as WordStyle,
+  StyleRunProperties, StyleValues, TabStop, TabStopLeaderCharValues, TabStopValues, Table,
   TableBorders, TableCell, TableCellBorders, TableCellChoice, TableCellLeftMargin, TableCellMargin,
   TableCellMarginDefault, TableCellProperties, TableCellRightMargin, TableCellVerticalAlignment,
   TableCellWidth, TableChoice2, TableGrid, TableJustification, TableLayout, TableLayoutValues,
   TableProperties, TableRow, TableRowAlignmentValues, TableRowChoice, TableRowHeight,
   TableRowProperties, TableRowPropertiesChoice, TableStyle, TableVerticalAlignmentValues,
   TableWidth, TableWidthUnitValues, Tabs, Text, TextType, TopBorder, TopMargin, Underline,
-  UnderlineValues,
+  UnderlineValues, UpdateFieldsOnOpen,
 };
 use ooxmlsdk::schemas::www_w3_org_xml_1998_namespace::SpaceProcessingModeValues;
 use ooxmlsdk::sdk::{SdkPart, WordprocessingDocumentType};
@@ -49,6 +55,7 @@ const BULLET_NUM_ID: i32 = 1;
 const TASK_DONE_NUM_ID: i32 = 3;
 const TASK_TODO_NUM_ID: i32 = 4;
 const FIRST_ORDERED_NUM_ID: i32 = 10;
+const DEFAULT_CONTENT_WIDTH_TWIPS: i64 = 8220;
 
 fn text_node(text: &str, preserve_space: bool) -> Text {
   Text(TextType {
@@ -60,6 +67,7 @@ fn text_node(text: &str, preserve_space: bool) -> Text {
 
 fn field_code_node(text: &str) -> FieldCode {
   FieldCode(TextType {
+    space: Some(SpaceProcessingModeValues::Preserve),
     xml_content: Some(text.to_string()),
     ..Default::default()
   })
@@ -82,10 +90,15 @@ fn signed_twips(value: i64) -> SignedTwipsMeasureValue {
   SignedTwipsMeasureValue::Twips(value)
 }
 
+fn twips_to_emu(value: i64) -> i64 {
+  value.saturating_mul(635)
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct DocxConfig {
   template: Option<PathBuf>,
+  body_style: Option<String>,
   section_number: bool,
   toc: bool,
   toc_depth: usize,
@@ -97,6 +110,7 @@ impl Default for DocxConfig {
   fn default() -> Self {
     Self {
       template: None,
+      body_style: None,
       section_number: false,
       toc: true,
       toc_depth: 3,
@@ -116,20 +130,58 @@ impl DocxConfig {
 struct DocxStyles {
   headings: [String; 9],
   title: String,
+  body: String,
   toc_heading: String,
+  toc_heading_text: String,
+  toc_tab_position: i64,
+  content_width_twips: i64,
+  image_max_width_emu: i64,
   toc_entries: [String; 9],
   code: String,
   list: String,
   quote: String,
   table: String,
   hyperlink: String,
+  body_run_fonts: RunFonts,
+  body_font_size: String,
+  heading_run_fonts: [RunFonts; 9],
+  heading_font_sizes: [String; 9],
+  toc_heading_run_fonts: RunFonts,
+  toc_heading_font_size: String,
+  toc_run_fonts: RunFonts,
+  toc_font_size: String,
 }
 
 struct DocxPackageParts<'a> {
   main_part: &'a MainDocumentPart,
   numbering_part: &'a NumberingDefinitionsPart,
   styles: &'a DocxStyles,
-  section_properties: Option<Box<SectionProperties>>,
+  template: Option<TemplateProfile>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TemplateProfile {
+  cover: Option<CoverTemplate>,
+  back_cover: Option<BackCoverTemplate>,
+  body_section_properties: Option<Box<SectionProperties>>,
+}
+
+#[derive(Clone, Debug)]
+struct CoverTemplate {
+  paragraphs: Vec<Paragraph>,
+  section_properties: Box<SectionProperties>,
+}
+
+#[derive(Clone, Debug)]
+struct BackCoverTemplate {
+  paragraph: Paragraph,
+  section_properties: Box<SectionProperties>,
+}
+
+#[derive(Clone, Debug)]
+struct EmptyHeaderFooterRefs {
+  header_id: String,
+  footer_id: String,
 }
 
 impl Default for DocxStyles {
@@ -137,13 +189,30 @@ impl Default for DocxStyles {
     Self {
       headings: std::array::from_fn(|index| format!("Heading{}", index + 1)),
       title: "Title".to_string(),
+      body: "Normal".to_string(),
       toc_heading: "TOCHeading".to_string(),
+      toc_heading_text: "Contents".to_string(),
+      toc_tab_position: DEFAULT_CONTENT_WIDTH_TWIPS,
+      content_width_twips: DEFAULT_CONTENT_WIDTH_TWIPS,
+      image_max_width_emu: twips_to_emu(DEFAULT_CONTENT_WIDTH_TWIPS),
       toc_entries: std::array::from_fn(|index| format!("TOC{}", index + 1)),
       code: "NoSpacing".to_string(),
       list: "ListParagraph".to_string(),
       quote: "Quote".to_string(),
       table: "TableGrid".to_string(),
       hyperlink: "Hyperlink".to_string(),
+      body_run_fonts: default_body_fonts(),
+      body_font_size: "21".to_string(),
+      heading_run_fonts: std::array::from_fn(|_| default_body_fonts()),
+      heading_font_sizes: std::array::from_fn(|index| match index {
+        0 => "28".to_string(),
+        1 => "24".to_string(),
+        _ => "21".to_string(),
+      }),
+      toc_heading_run_fonts: default_body_fonts(),
+      toc_heading_font_size: "48".to_string(),
+      toc_run_fonts: default_body_fonts(),
+      toc_font_size: "21".to_string(),
     }
   }
 }
@@ -162,7 +231,8 @@ impl DocxStyles {
       ParagraphKind::Code => Some(&self.code),
       ParagraphKind::List => Some(&self.list),
       ParagraphKind::Quote => Some(&self.quote),
-      ParagraphKind::Normal => None,
+      ParagraphKind::Normal => Some(&self.body),
+      ParagraphKind::Heading => None,
     }
   }
 }
@@ -214,7 +284,7 @@ fn write_docx_from_scratch(ctx: &RenderContext, cfg: &DocxConfig, path: &Path) -
       main_part: &main_part,
       numbering_part: &numbering_part,
       styles: &styles,
-      section_properties: None,
+      template: None,
     },
   )
 }
@@ -231,9 +301,8 @@ fn write_docx_from_template(
   let mut package = WordprocessingDocument::create_from_template(&template_path)
     .with_context(|| format!("failed to read DOCX template {}", template_path.display()))?;
   let main_part = package.main_document_part()?;
-  let section_properties = template_section_properties(&mut package, &main_part)?;
   let numbering_part = ensure_numbering_part(&mut package, &main_part)?;
-  let styles = resolve_docx_styles(&mut package, &main_part);
+  let (styles, template_profile) = template_profile(&mut package, &main_part, cfg)?;
 
   write_docx_package(
     ctx,
@@ -244,7 +313,7 @@ fn write_docx_from_template(
       main_part: &main_part,
       numbering_part: &numbering_part,
       styles: &styles,
-      section_properties,
+      template: Some(template_profile),
     },
   )
 }
@@ -262,12 +331,13 @@ fn write_docx_package(
     package,
     parts.main_part,
     parts.styles,
-    parts.section_properties,
+    parts.template,
   )?;
   parts.main_part.set_root_element(package, document)?;
   parts
     .numbering_part
     .set_root_element(package, numbering_definitions(&ordered_lists))?;
+  enable_update_fields_on_open(package, parts.main_part)?;
 
   let file = File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
   package.save(file)?;
@@ -280,10 +350,10 @@ fn render_document(
   package: &mut WordprocessingDocument,
   main_part: &MainDocumentPart,
   styles: &DocxStyles,
-  section_properties: Option<Box<SectionProperties>>,
+  template: Option<TemplateProfile>,
 ) -> Result<(Document, Vec<OrderedListDefinition>)> {
   let mut docx = DocxRenderContext::new(ctx, package, main_part, cfg, styles.clone());
-  let document = document(ctx, cfg, &mut docx, section_properties)?;
+  let document = document(ctx, cfg, &mut docx, template)?;
   Ok((document, docx.ordered_lists))
 }
 
@@ -299,9 +369,38 @@ fn ensure_numbering_part(
   Ok(main_part.add_part(package, numbering_part)?)
 }
 
+fn ensure_settings_part(
+  package: &mut WordprocessingDocument,
+  main_part: &MainDocumentPart,
+) -> Result<DocumentSettingsPart> {
+  if let Some(settings_part) = main_part.document_settings_part(package) {
+    return Ok(settings_part);
+  }
+
+  let settings_part = package.add_new_part_auto_id::<DocumentSettingsPart>()?;
+  Ok(main_part.add_part(package, settings_part)?)
+}
+
+fn enable_update_fields_on_open(
+  package: &mut WordprocessingDocument,
+  main_part: &MainDocumentPart,
+) -> Result<()> {
+  let settings_part = ensure_settings_part(package, main_part)?;
+  let mut settings = settings_part
+    .root_element(package)
+    .cloned()
+    .unwrap_or_else(|_| Settings::default());
+  settings.update_fields_on_open = Some(UpdateFieldsOnOpen {
+    val: Some(OnOffValue::True),
+  });
+  settings_part.set_root_element(package, settings)?;
+  Ok(())
+}
+
 fn resolve_docx_styles(
   package: &mut WordprocessingDocument,
   main_part: &MainDocumentPart,
+  cfg: &DocxConfig,
 ) -> DocxStyles {
   let mut styles = DocxStyles::default();
   let Some(style_part) = main_part.style_definitions_part(package) else {
@@ -313,10 +412,12 @@ fn resolve_docx_styles(
 
   let mut names = HashMap::new();
   let mut paragraph_outline = HashMap::new();
+  let mut style_by_id = HashMap::new();
   for style in &root.style {
     let Some(style_id) = style.style_id.as_ref() else {
       continue;
     };
+    style_by_id.insert(style_id.clone(), style);
     if let Some(name) = style.style_name.as_ref() {
       names.insert(normalize_style_name(&name.val), style_id.clone());
     }
@@ -350,8 +451,18 @@ fn resolve_docx_styles(
   if let Some(style_id) = names.get("title") {
     styles.title = style_id.clone();
   }
+  if let Some(style_id) = cfg
+    .body_style
+    .as_deref()
+    .and_then(|style| configured_style_id(style, &names, &style_by_id))
+    .or_else(|| names.get("body text").cloned())
+    .or_else(|| names.get("normal").cloned())
+  {
+    styles.body = style_id.clone();
+  }
   if let Some(style_id) = names.get("toc heading") {
     styles.toc_heading = style_id.clone();
+    styles.toc_heading_text = "目录".to_string();
   }
   if let Some(style_id) = names.get("list paragraph") {
     styles.list = style_id.clone();
@@ -375,6 +486,7 @@ fn resolve_docx_styles(
     styles.hyperlink = style_id.clone();
   }
 
+  apply_style_metrics(&style_by_id, &mut styles);
   styles
 }
 
@@ -386,17 +498,128 @@ fn normalize_style_name(name: &str) -> String {
     .to_ascii_lowercase()
 }
 
-fn template_section_properties(
+fn configured_style_id(
+  configured: &str,
+  names: &HashMap<String, String>,
+  style_by_id: &HashMap<String, &WordStyle>,
+) -> Option<String> {
+  let configured = configured.trim();
+  if configured.is_empty() {
+    return None;
+  }
+  names
+    .get(&normalize_style_name(configured))
+    .cloned()
+    .or_else(|| {
+      style_by_id
+        .contains_key(configured)
+        .then(|| configured.to_string())
+    })
+}
+
+fn apply_style_metrics(style_by_id: &HashMap<String, &WordStyle>, styles: &mut DocxStyles) {
+  if let Some(style) = style_by_id.get(&styles.body) {
+    if let Some(fonts) = style_run_fonts(style) {
+      styles.body_run_fonts = merged_run_fonts(&styles.body_run_fonts, fonts);
+    }
+    if let Some(size) = style_font_size(style) {
+      styles.body_font_size = size;
+    }
+  }
+
+  for level in 1..=9 {
+    if let Some(style) = style_by_id.get(styles.heading(level)) {
+      if let Some(fonts) = style_run_fonts(style) {
+        styles.heading_run_fonts[level - 1] =
+          merged_run_fonts(&styles.heading_run_fonts[level - 1], fonts);
+      }
+      if let Some(size) = style_font_size(style) {
+        styles.heading_font_sizes[level - 1] = size;
+      }
+    }
+  }
+
+  if let Some(style) = style_by_id.get(&styles.toc_heading) {
+    if let Some(fonts) = style_run_fonts(style) {
+      styles.toc_heading_run_fonts = merged_run_fonts(&styles.toc_heading_run_fonts, fonts);
+    }
+    if let Some(size) = style_font_size(style) {
+      styles.toc_heading_font_size = size;
+    }
+  }
+
+  let toc_style = style_by_id.get(styles.toc_entry(1));
+  if let Some(style) = toc_style {
+    if let Some(fonts) = style_run_fonts(style) {
+      styles.toc_run_fonts = merged_run_fonts(&styles.toc_run_fonts, fonts);
+    }
+    if let Some(size) = style_font_size(style) {
+      styles.toc_font_size = size;
+    }
+    if let Some(position) = style_tab_position(style) {
+      styles.toc_tab_position = position;
+    }
+  }
+}
+
+fn style_run_properties(style: &WordStyle) -> Option<&StyleRunProperties> {
+  style.style_run_properties.as_deref()
+}
+
+fn style_run_fonts(style: &WordStyle) -> Option<RunFonts> {
+  style_run_properties(style)?.run_fonts.clone()
+}
+
+fn merged_run_fonts(base: &RunFonts, mut override_fonts: RunFonts) -> RunFonts {
+  override_fonts.ascii = override_fonts.ascii.or_else(|| base.ascii.clone());
+  override_fonts.high_ansi = override_fonts.high_ansi.or_else(|| base.high_ansi.clone());
+  override_fonts.east_asia = override_fonts.east_asia.or_else(|| base.east_asia.clone());
+  override_fonts.complex_script = override_fonts
+    .complex_script
+    .or_else(|| base.complex_script.clone());
+  override_fonts
+}
+
+fn style_font_size(style: &WordStyle) -> Option<String> {
+  style_run_properties(style)?
+    .font_size
+    .as_ref()
+    .map(|size| size.val.clone())
+}
+
+fn style_tab_position(style: &WordStyle) -> Option<i64> {
+  style
+    .style_paragraph_properties
+    .as_ref()?
+    .tabs
+    .as_ref()?
+    .tab_stop
+    .iter()
+    .find(|tab| tab.val == TabStopValues::Right)
+    .or_else(|| {
+      style
+        .style_paragraph_properties
+        .as_ref()
+        .and_then(|properties| properties.tabs.as_ref())
+        .and_then(|tabs| tabs.tab_stop.first())
+    })
+    .map(|tab| tab.position.to_twips())
+}
+
+fn template_profile(
   package: &mut WordprocessingDocument,
   main_part: &MainDocumentPart,
-) -> Result<Option<Box<SectionProperties>>> {
+  cfg: &DocxConfig,
+) -> Result<(DocxStyles, TemplateProfile)> {
+  let mut styles = resolve_docx_styles(package, main_part, cfg);
+  let empty_header_footer = empty_header_footer_refs(package, main_part)?;
   let document = main_part.root_element(package)?;
   let Some(body) = document.body.as_ref() else {
-    return Ok(None);
+    return Ok((styles, TemplateProfile::default()));
   };
 
-  let mut section_properties = body.section_properties.clone();
-  let referenced_section_properties = body.body_choice.iter().find_map(|choice| {
+  let body_section_properties = body.section_properties.clone();
+  let paragraph_section_properties = body.body_choice.iter().find_map(|choice| {
     let BodyChoice::Paragraph(paragraph) = choice else {
       return None;
     };
@@ -408,18 +631,319 @@ fn template_section_properties(
       .cloned()
   });
 
-  if let Some(referenced_section_properties) = referenced_section_properties {
-    if let Some(section_properties) = section_properties.as_mut() {
-      if section_properties.section_properties_choice.is_empty() {
-        section_properties.section_properties_choice =
-          referenced_section_properties.section_properties_choice;
-      }
-    } else {
-      section_properties = Some(referenced_section_properties);
+  let body_section_properties = paragraph_section_properties
+    .clone()
+    .or(body_section_properties);
+  if let Some(content_width) = section_content_width_twips(body_section_properties.as_deref()) {
+    styles.content_width_twips = content_width;
+    styles.image_max_width_emu = twips_to_emu(content_width);
+    if styles.toc_tab_position == DEFAULT_CONTENT_WIDTH_TWIPS {
+      styles.toc_tab_position = content_width;
     }
   }
+  let cover = template_cover(body, body_section_properties.clone(), &empty_header_footer);
+  let back_cover = template_back_cover(body, body_section_properties.clone(), &empty_header_footer);
 
-  Ok(section_properties)
+  Ok((
+    styles,
+    TemplateProfile {
+      cover,
+      back_cover,
+      body_section_properties,
+    },
+  ))
+}
+
+fn template_cover(
+  body: &Body,
+  section_properties: Option<Box<SectionProperties>>,
+  empty_header_footer: &EmptyHeaderFooterRefs,
+) -> Option<CoverTemplate> {
+  let section_properties = section_properties?;
+  let page_extent = section_page_extent_emu(&section_properties);
+  let mut paragraphs = Vec::new();
+
+  for choice in &body.body_choice {
+    let BodyChoice::Paragraph(paragraph) = choice else {
+      break;
+    };
+    if paragraph
+      .paragraph_properties
+      .as_ref()
+      .and_then(|properties| properties.section_properties.as_ref())
+      .is_some()
+    {
+      break;
+    }
+    let mut paragraph = (**paragraph).clone();
+    normalize_page_background_paragraph(&mut paragraph, page_extent);
+    paragraphs.push(paragraph);
+  }
+
+  if !paragraphs.iter().any(paragraph_has_drawing) {
+    return None;
+  }
+
+  Some(CoverTemplate {
+    paragraphs,
+    section_properties: empty_header_footer_section(&section_properties, empty_header_footer),
+  })
+}
+
+fn template_back_cover(
+  body: &Body,
+  section_properties: Option<Box<SectionProperties>>,
+  empty_header_footer: &EmptyHeaderFooterRefs,
+) -> Option<BackCoverTemplate> {
+  let section_properties = section_properties?;
+  let page_extent = section_page_extent_emu(&section_properties);
+  let mut paragraph = body.body_choice.iter().rev().find_map(|choice| {
+    let BodyChoice::Paragraph(paragraph) = choice else {
+      return None;
+    };
+    paragraph_is_back_cover(paragraph, page_extent).then(|| (**paragraph).clone())
+  })?;
+  normalize_page_background_paragraph(&mut paragraph, page_extent);
+
+  Some(BackCoverTemplate {
+    paragraph,
+    section_properties: empty_header_footer_section(&section_properties, empty_header_footer),
+  })
+}
+
+fn paragraph_is_back_cover(paragraph: &Paragraph, page_extent: Option<(i64, i64)>) -> bool {
+  paragraph
+    .paragraph_choice
+    .iter()
+    .any(|choice| matches!(choice, ParagraphChoice::WRun(run) if run_has_back_cover_anchor(run, page_extent)))
+}
+
+fn run_has_back_cover_anchor(run: &Run, page_extent: Option<(i64, i64)>) -> bool {
+  run.run_choice.iter().any(|choice| {
+    let RunChoice::Drawing(drawing) = choice else {
+      return false;
+    };
+    let Some(DrawingChoice::Anchor(anchor)) = drawing.drawing_choice.as_ref() else {
+      return false;
+    };
+    anchor.behind_doc.as_bool() && anchor_matches_page_size(anchor, page_extent)
+  })
+}
+
+fn anchor_matches_page_size(anchor: &wp::Anchor, page_extent: Option<(i64, i64)>) -> bool {
+  let Some((page_width, page_height)) = page_extent else {
+    return true;
+  };
+  let width_delta = (anchor.extent.cx - page_width).abs();
+  let height_delta = (anchor.extent.cy - page_height).abs();
+  width_delta <= page_width / 10 && height_delta <= page_height / 10
+}
+
+fn empty_header_footer_refs(
+  package: &mut WordprocessingDocument,
+  main_part: &MainDocumentPart,
+) -> Result<EmptyHeaderFooterRefs> {
+  let header_xmlns = template_header_xmlns(package, main_part);
+  let footer_xmlns = template_footer_xmlns(package, main_part);
+
+  let header_part = main_part.add_new_part_auto_id::<_, HeaderPart>(package)?;
+  header_part.set_root_element(
+    package,
+    Header {
+      xmlns: header_xmlns,
+      xml_header: XmlHeaderType::Standalone,
+      ..Default::default()
+    },
+  )?;
+  let header_id = main_part
+    .get_id_of_part(package, &header_part)
+    .context("empty header part missing relationship id")?
+    .to_string();
+
+  let footer_part = main_part.add_new_part_auto_id::<_, FooterPart>(package)?;
+  footer_part.set_root_element(
+    package,
+    Footer {
+      xmlns: footer_xmlns,
+      xml_header: XmlHeaderType::Standalone,
+      footer_choice: vec![FooterChoice::Paragraph(Box::new(
+        zero_height_header_footer_paragraph(),
+      ))],
+      ..Default::default()
+    },
+  )?;
+  let footer_id = main_part
+    .get_id_of_part(package, &footer_part)
+    .context("empty footer part missing relationship id")?
+    .to_string();
+
+  Ok(EmptyHeaderFooterRefs {
+    header_id,
+    footer_id,
+  })
+}
+
+fn template_header_xmlns(
+  package: &mut WordprocessingDocument,
+  main_part: &MainDocumentPart,
+) -> Vec<XmlNamespaceDecl> {
+  let header_parts = main_part.header_parts(package).collect::<Vec<_>>();
+  for header_part in header_parts {
+    if let Ok(header) = header_part.root_element(package)
+      && !header.xmlns.is_empty()
+    {
+      return header.xmlns.clone();
+    }
+  }
+  wordprocessing_xmlns()
+}
+
+fn template_footer_xmlns(
+  package: &mut WordprocessingDocument,
+  main_part: &MainDocumentPart,
+) -> Vec<XmlNamespaceDecl> {
+  let footer_parts = main_part.footer_parts(package).collect::<Vec<_>>();
+  for footer_part in footer_parts {
+    if let Ok(footer) = footer_part.root_element(package)
+      && !footer.xmlns.is_empty()
+    {
+      return footer.xmlns.clone();
+    }
+  }
+  wordprocessing_xmlns()
+}
+
+fn wordprocessing_xmlns() -> Vec<XmlNamespaceDecl> {
+  vec![XmlNamespaceDecl::new(
+    "w",
+    "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+  )]
+}
+
+fn zero_height_header_footer_paragraph() -> Paragraph {
+  Paragraph {
+    paragraph_properties: Some(Box::new(ParagraphProperties {
+      spacing_between_lines: Some(SpacingBetweenLines {
+        before: Some(twips(0)),
+        after: Some(twips(0)),
+        line: Some(signed_twips(1)),
+        line_rule: Some(LineSpacingRuleValues::Exact),
+        ..Default::default()
+      }),
+      paragraph_mark_run_properties: Some(Box::new(paragraph_mark_run_properties(
+        "1",
+        false,
+        &default_body_fonts(),
+      ))),
+      ..Default::default()
+    })),
+    ..Default::default()
+  }
+}
+
+fn empty_header_footer_section(
+  section_properties: &SectionProperties,
+  empty_header_footer: &EmptyHeaderFooterRefs,
+) -> Box<SectionProperties> {
+  let mut section_properties = section_properties.clone();
+  section_properties
+    .section_properties_choice
+    .retain(|choice| {
+      !matches!(
+        choice,
+        SectionPropertiesChoice::HeaderReference(_) | SectionPropertiesChoice::FooterReference(_)
+      )
+    });
+  section_properties.section_properties_choice.insert(
+    0,
+    SectionPropertiesChoice::FooterReference(Box::new(FooterReference {
+      r#type: HeaderFooterValues::Default,
+      id: empty_header_footer.footer_id.clone(),
+    })),
+  );
+  section_properties.section_properties_choice.insert(
+    0,
+    SectionPropertiesChoice::HeaderReference(Box::new(HeaderReference {
+      r#type: HeaderFooterValues::Default,
+      id: empty_header_footer.header_id.clone(),
+    })),
+  );
+  section_properties.section_type = Some(SectionType {
+    val: SectionMarkValues::NextPage,
+  });
+  if let Some(page_margin) = section_properties.page_margin.as_mut() {
+    page_margin.top = Some(signed_twips(0));
+    page_margin.header = Some(twips(0));
+    page_margin.footer = Some(twips(0));
+  }
+  Box::new(section_properties)
+}
+
+fn section_page_extent_emu(section_properties: &SectionProperties) -> Option<(i64, i64)> {
+  let size = section_properties.page_size.as_ref()?;
+  Some((size.width?.to_emu(), size.height?.to_emu()))
+}
+
+fn normalize_page_background_paragraph(paragraph: &mut Paragraph, page_extent: Option<(i64, i64)>) {
+  for choice in &mut paragraph.paragraph_choice {
+    let ParagraphChoice::WRun(run) = choice else {
+      continue;
+    };
+    normalize_page_background_run(run, page_extent);
+  }
+}
+
+fn normalize_page_background_run(run: &mut Run, page_extent: Option<(i64, i64)>) {
+  for choice in &mut run.run_choice {
+    let RunChoice::Drawing(drawing) = choice else {
+      continue;
+    };
+    let Some(DrawingChoice::Anchor(anchor)) = drawing.drawing_choice.as_mut() else {
+      continue;
+    };
+    if !anchor.behind_doc.as_bool() || !anchor_matches_page_size(anchor, page_extent) {
+      continue;
+    }
+    let Some((page_width, page_height)) = page_extent else {
+      continue;
+    };
+    anchor.distance_from_top = Some(0);
+    anchor.distance_from_bottom = Some(0);
+    anchor.distance_from_left = Some(0);
+    anchor.distance_from_right = Some(0);
+    anchor.horizontal_position.relative_from = wp::HorizontalRelativePositionValues::Page;
+    anchor.horizontal_position.horizontal_position_choice =
+      Some(wp::HorizontalPositionChoice::PositionOffset(0));
+    anchor.vertical_position.relative_from = wp::VerticalRelativePositionValues::Page;
+    anchor.vertical_position.vertical_position_choice =
+      Some(wp::VerticalPositionChoice::PositionOffset(0));
+    anchor.extent.cx = page_width;
+    anchor.extent.cy = page_height;
+    anchor.anchor_choice = Some(wp::AnchorChoice::WrapNone);
+  }
+}
+
+fn section_content_width_twips(section_properties: Option<&SectionProperties>) -> Option<i64> {
+  let section_properties = section_properties?;
+  let page_width = section_properties
+    .page_size
+    .as_ref()?
+    .width
+    .map(TwipsMeasureValue::to_twips)?;
+  let page_margin = section_properties.page_margin.as_ref()?;
+  let left = page_margin.left.map(TwipsMeasureValue::to_twips)?;
+  let right = page_margin.right.map(TwipsMeasureValue::to_twips)?;
+  let gutter = page_margin
+    .gutter
+    .map(TwipsMeasureValue::to_twips)
+    .unwrap_or(0);
+  Some((page_width - left - right - gutter).max(1))
+}
+
+fn paragraph_has_drawing(paragraph: &Paragraph) -> bool {
+  paragraph.paragraph_choice.iter().any(|choice| {
+    matches!(choice, ParagraphChoice::WRun(run) if run.run_choice.iter().any(|run_choice| matches!(run_choice, RunChoice::Drawing(_))))
+  })
 }
 
 fn load_config(ctx: &RenderContext) -> Result<DocxConfig> {
@@ -434,14 +958,33 @@ fn document(
   ctx: &RenderContext,
   cfg: &DocxConfig,
   docx: &mut DocxRenderContext<'_>,
-  section_properties: Option<Box<SectionProperties>>,
+  template: Option<TemplateProfile>,
 ) -> Result<Document> {
+  let body_section_properties = template
+    .as_ref()
+    .and_then(|template| template.body_section_properties.clone());
+  let back_cover = template
+    .as_ref()
+    .and_then(|template| template.back_cover.clone());
+  let final_section_properties = back_cover
+    .as_ref()
+    .map(|back_cover| back_cover.section_properties.clone())
+    .or_else(|| body_section_properties.clone());
   let mut body = Body {
-    section_properties,
+    section_properties: final_section_properties,
     ..Default::default()
   };
 
-  if let Some(title) = &ctx.config.book.title {
+  if let Some(cover) = template
+    .as_ref()
+    .and_then(|template| template.cover.clone())
+  {
+    body.body_choice.extend(
+      render_template_cover(ctx, cover)
+        .into_iter()
+        .map(|paragraph| BodyChoice::Paragraph(Box::new(paragraph))),
+    );
+  } else if let Some(title) = &ctx.config.book.title {
     body
       .body_choice
       .push(BodyChoice::Paragraph(Box::new(cover_title_paragraph(
@@ -479,6 +1022,14 @@ fn document(
     }
   }
 
+  if let Some(back_cover) = back_cover {
+    body.body_choice.extend(
+      render_template_back_cover(back_cover, body_section_properties)
+        .into_iter()
+        .map(|paragraph| BodyChoice::Paragraph(Box::new(paragraph))),
+    );
+  }
+
   Ok(Document {
     xmlns: vec![
       XmlNamespaceDecl::new(
@@ -497,6 +1048,18 @@ fn document(
       XmlNamespaceDecl::new(
         "pic",
         "http://schemas.openxmlformats.org/drawingml/2006/picture",
+      ),
+      XmlNamespaceDecl::new(
+        "w14",
+        "http://schemas.microsoft.com/office/word/2010/wordml",
+      ),
+      XmlNamespaceDecl::new(
+        "w15",
+        "http://schemas.microsoft.com/office/word/2012/wordml",
+      ),
+      XmlNamespaceDecl::new(
+        "wp14",
+        "http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing",
       ),
     ],
     body: Some(Box::new(body)),
@@ -663,7 +1226,7 @@ fn chapter_body(
         if let Some(table) = &mut table {
           table.start_cell();
         }
-        paragraph = ParagraphBuilder::default();
+        paragraph = ParagraphBuilder::for_block(ParagraphKind::Normal, 0, None, &docx.styles);
       }
       Event::End(TagEnd::TableCell) => {
         paragraph.flush_to(&mut out, &mut table);
@@ -698,6 +1261,7 @@ fn chapter_body(
         out.push(BodyChoice::Paragraph(Box::new(paragraph_from_text(
           "----------------------------------------",
           RunStyle::default(),
+          &docx.styles,
         ))));
       }
       Event::TaskListMarker(checked) => {
@@ -827,6 +1391,7 @@ impl<'a> DocxRenderContext<'a> {
         relationship_id,
         width,
         height,
+        max_width_emu: self.styles.image_max_width_emu,
         alt: alt.to_string(),
       };
       self.images.insert(image_path, image.clone());
@@ -985,6 +1550,7 @@ struct ImageRef {
   relationship_id: String,
   width: u32,
   height: u32,
+  max_width_emu: i64,
   alt: String,
 }
 
@@ -1016,6 +1582,7 @@ enum LinkTarget {
 enum ParagraphKind {
   #[default]
   Normal,
+  Heading,
   Code,
   List,
   Quote,
@@ -1035,6 +1602,15 @@ struct RunStyle {
   strike: bool,
   code: bool,
   hyperlink: bool,
+  base: RunBase,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RunBase {
+  #[default]
+  None,
+  Body,
+  Heading(usize),
 }
 
 #[derive(Debug, Default)]
@@ -1042,18 +1618,24 @@ struct ParagraphBuilder {
   runs: Vec<ParagraphChoice>,
   style: StyleDepth,
   paragraph_style: Option<String>,
+  styles: DocxStyles,
   kind: ParagraphKind,
+  run_base: RunBase,
   quote_depth: usize,
   list_depth: Option<usize>,
   list_numbering_id: Option<i32>,
   link_stack: Vec<LinkTarget>,
   bookmark: Option<BookmarkRef>,
+  has_image: bool,
 }
 
 impl ParagraphBuilder {
   fn with_heading(level: usize, styles: &DocxStyles) -> Self {
     Self {
       paragraph_style: Some(styles.heading(level).to_string()),
+      styles: styles.clone(),
+      kind: ParagraphKind::Heading,
+      run_base: RunBase::Heading(level.clamp(1, 9)),
       ..Default::default()
     }
   }
@@ -1066,7 +1648,13 @@ impl ParagraphBuilder {
   ) -> Self {
     Self {
       paragraph_style: styles.block_style(kind).map(str::to_string),
+      styles: styles.clone(),
       kind,
+      run_base: if matches!(kind, ParagraphKind::Code) {
+        RunBase::None
+      } else {
+        RunBase::Body
+      },
       quote_depth,
       list_depth,
       ..Default::default()
@@ -1082,6 +1670,13 @@ impl ParagraphBuilder {
   }
 
   fn push_run_node(&mut self, run: Run) {
+    if run
+      .run_choice
+      .iter()
+      .any(|choice| matches!(choice, RunChoice::Drawing(_)))
+    {
+      self.has_image = true;
+    }
     self.runs.push(ParagraphChoice::WRun(Box::new(run)));
   }
 
@@ -1092,6 +1687,7 @@ impl ParagraphBuilder {
       strike: self.style.strike > 0,
       code: matches!(self.kind, ParagraphKind::Code),
       hyperlink: !self.link_stack.is_empty(),
+      base: self.run_base,
     }
   }
 
@@ -1114,7 +1710,7 @@ impl ParagraphBuilder {
   }
 
   fn push_text_run(&mut self, text: &str, style: RunStyle) {
-    let run = text_run(text, style);
+    let run = text_run(text, style, &self.styles);
     if let Some(link) = self.link_stack.last() {
       self
         .runs
@@ -1152,6 +1748,8 @@ impl ParagraphBuilder {
         self.quote_depth,
         self.list_depth,
         self.list_numbering_id,
+        self.has_image,
+        &self.styles,
       ))),
       paragraph_choice,
       ..Default::default()
@@ -1164,6 +1762,7 @@ impl ParagraphBuilder {
 #[derive(Debug, Default)]
 struct TableBuilder {
   table_style: String,
+  table_width: i64,
   alignments: Vec<Alignment>,
   rows: Vec<TableRowData>,
   current_row: Vec<TableCellData>,
@@ -1189,6 +1788,7 @@ impl TableBuilder {
   fn new(styles: &DocxStyles, alignments: Vec<Alignment>) -> Self {
     Self {
       table_style: styles.table.clone(),
+      table_width: styles.content_width_twips,
       alignments,
       ..Default::default()
     }
@@ -1242,7 +1842,7 @@ impl TableBuilder {
       .max()
       .unwrap_or(1)
       .max(1);
-    let table_width = 8220i64;
+    let table_width = self.table_width.max(1);
     let cell_width = table_width / column_count as i64;
     let alignments = self.alignments;
 
@@ -1295,7 +1895,11 @@ impl TableBuilder {
                     shading: is_head.then(table_shading),
                     table_cell_margin: Some(Box::new(table_cell_margin())),
                     table_cell_vertical_alignment: Some(TableCellVerticalAlignment {
-                      val: TableVerticalAlignmentValues::Center,
+                      val: if is_head {
+                        TableVerticalAlignmentValues::Center
+                      } else {
+                        TableVerticalAlignmentValues::Top
+                      },
                     }),
                     ..Default::default()
                   })),
@@ -1338,6 +1942,7 @@ fn table_cell_paragraphs(
           paragraph_alignment(alignment)
         },
       });
+      properties.indentation = None;
       properties.spacing_between_lines = Some(SpacingBetweenLines {
         before: Some(twips(0)),
         after: Some(twips(0)),
@@ -1504,7 +2109,15 @@ fn code_paragraph(
       .collect()
   };
 
-  let mut properties = block_properties(Some(&styles.code), ParagraphKind::Code, 0, None, None);
+  let mut properties = block_properties(
+    Some(&styles.code),
+    ParagraphKind::Code,
+    0,
+    None,
+    None,
+    false,
+    styles,
+  );
   properties.shading = Some(fill_shading(background));
   properties.indentation = Some(Indentation {
     left: Some(signed_twips(200)),
@@ -1579,8 +2192,10 @@ fn heading_paragraph_with_bookmark(
       text,
       RunStyle {
         bold: true,
+        base: RunBase::Heading(level.clamp(1, 9)),
         ..Default::default()
       },
+      styles,
     ))));
     paragraph_choice.push(ParagraphChoice::BookmarkEnd(Box::new(BookmarkEnd {
       id: bookmark.id,
@@ -1591,8 +2206,10 @@ fn heading_paragraph_with_bookmark(
       text,
       RunStyle {
         bold: true,
+        base: RunBase::Heading(level.clamp(1, 9)),
         ..Default::default()
       },
+      styles,
     ))));
   }
 
@@ -1600,6 +2217,100 @@ fn heading_paragraph_with_bookmark(
     paragraph_properties: Some(Box::new(paragraph_properties(styles.heading(level)))),
     paragraph_choice,
     ..Default::default()
+  }
+}
+
+fn render_template_cover(ctx: &RenderContext, cover: CoverTemplate) -> Vec<Paragraph> {
+  let title = ctx.config.book.title.as_deref().unwrap_or("book");
+  let mut paragraphs = cover.paragraphs;
+  let text_indices = paragraphs
+    .iter()
+    .enumerate()
+    .filter_map(|(index, paragraph)| {
+      (!paragraph_text(paragraph).trim().is_empty()).then_some(index)
+    })
+    .collect::<Vec<_>>();
+
+  if let Some(index) = text_indices.first() {
+    replace_paragraph_text(&mut paragraphs[*index], title);
+  }
+  if let Some(index) = text_indices.get(1) {
+    replace_paragraph_text(&mut paragraphs[*index], "");
+  }
+
+  let author_indices = text_indices.into_iter().skip(2).collect::<Vec<_>>();
+  for (author_index, paragraph_index) in author_indices.iter().copied().enumerate() {
+    replace_paragraph_text(
+      &mut paragraphs[paragraph_index],
+      ctx
+        .config
+        .book
+        .authors
+        .get(author_index)
+        .map_or("", String::as_str),
+    );
+  }
+  if let Some(last_author_index) = author_indices.last().copied() {
+    for (insert_at, author) in
+      (last_author_index + 1..).zip(ctx.config.book.authors.iter().skip(author_indices.len()))
+    {
+      let mut paragraph = paragraphs[last_author_index].clone();
+      replace_paragraph_text(&mut paragraph, author);
+      paragraphs.insert(insert_at, paragraph);
+    }
+  }
+
+  paragraphs.push(section_break_paragraph(cover.section_properties));
+  paragraphs
+}
+
+fn render_template_back_cover(
+  back_cover: BackCoverTemplate,
+  body_section_properties: Option<Box<SectionProperties>>,
+) -> Vec<Paragraph> {
+  let mut paragraphs = Vec::new();
+  if let Some(body_section_properties) = body_section_properties {
+    paragraphs.push(section_break_paragraph(body_section_properties));
+  } else {
+    paragraphs.push(page_break_paragraph());
+  }
+  paragraphs.push(back_cover.paragraph);
+  paragraphs
+}
+
+fn paragraph_text(paragraph: &Paragraph) -> String {
+  let mut out = String::new();
+  for choice in &paragraph.paragraph_choice {
+    if let ParagraphChoice::WRun(run) = choice {
+      for run_choice in &run.run_choice {
+        if let RunChoice::Text(text) = run_choice
+          && let Some(content) = &text.0.xml_content
+        {
+          out.push_str(content);
+        }
+      }
+    }
+  }
+  out
+}
+
+fn replace_paragraph_text(paragraph: &mut Paragraph, replacement: &str) {
+  let mut replaced = false;
+  for choice in &mut paragraph.paragraph_choice {
+    if let ParagraphChoice::WRun(run) = choice {
+      for run_choice in &mut run.run_choice {
+        if let RunChoice::Text(text) = run_choice {
+          if replaced {
+            text.0.xml_content = None;
+          } else {
+            text.0.xml_content = Some(replacement.to_string());
+            text.0.space =
+              text_needs_preserve(replacement).then_some(SpaceProcessingModeValues::Preserve);
+            replaced = true;
+          }
+        }
+      }
+    }
   }
 }
 
@@ -1637,22 +2348,53 @@ fn cover_title_paragraph(text: &str, styles: &DocxStyles) -> Paragraph {
 }
 
 fn toc_heading_paragraph(text: &str, styles: &DocxStyles) -> Paragraph {
+  let mut properties = paragraph_properties(&styles.toc_heading);
+  properties.justification = Some(Justification {
+    val: JustificationValues::Center,
+  });
+  properties.spacing_between_lines = Some(SpacingBetweenLines {
+    before: Some(twips(0)),
+    after: Some(twips(0)),
+    line: Some(signed_twips(240)),
+    line_rule: Some(LineSpacingRuleValues::Auto),
+    ..Default::default()
+  });
+
   Paragraph {
-    paragraph_properties: Some(Box::new(paragraph_properties(&styles.toc_heading))),
-    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(text_run(
-      text,
-      RunStyle {
-        bold: true,
-        ..Default::default()
-      },
+    paragraph_properties: Some(Box::new(properties)),
+    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(toc_heading_run(
+      text, styles,
     )))],
     ..Default::default()
   }
 }
 
-fn paragraph_from_text(text: &str, style: RunStyle) -> Paragraph {
+fn toc_heading_run(text: &str, styles: &DocxStyles) -> Run {
+  Run {
+    run_properties: Some(Box::new(RunProperties {
+      run_properties_choice: vec![
+        RunPropertiesChoice::RunFonts(Box::new(styles.toc_heading_run_fonts.clone())),
+        RunPropertiesChoice::Bold(Box::default()),
+        RunPropertiesChoice::BoldComplexScript(Box::default()),
+        RunPropertiesChoice::FontSize(Box::new(FontSize {
+          val: styles.toc_heading_font_size.clone(),
+        })),
+        RunPropertiesChoice::FontSizeComplexScript(Box::new(FontSizeComplexScript {
+          val: styles.toc_heading_font_size.clone(),
+        })),
+      ],
+      ..Default::default()
+    })),
+    run_choice: vec![RunChoice::Text(Box::new(text_node(text, false)))],
+    ..Default::default()
+  }
+}
+
+fn paragraph_from_text(text: &str, style: RunStyle, styles: &DocxStyles) -> Paragraph {
   Paragraph {
-    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(text_run(text, style)))],
+    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(text_run(
+      text, style, styles,
+    )))],
     ..Default::default()
   }
 }
@@ -1667,7 +2409,7 @@ fn paragraph_properties(style: &str) -> ParagraphProperties {
 }
 
 fn image_drawing(id: u32, image: &ImageRef) -> Drawing {
-  let (cx, cy) = image_extent(image.width, image.height);
+  let (cx, cy) = image_extent(image.width, image.height, image.max_width_emu);
   Drawing {
     drawing_choice: Some(DrawingChoice::Inline(Box::new(wp::Inline {
       distance_from_top: Some(0),
@@ -1760,13 +2502,13 @@ fn image_drawing(id: u32, image: &ImageRef) -> Drawing {
   }
 }
 
-fn image_extent(width: u32, height: u32) -> (i64, i64) {
+fn image_extent(width: u32, height: u32, max_width_emu: i64) -> (i64, i64) {
   const EMU_PER_PIXEL: f64 = 9525.0;
-  const MAX_WIDTH_EMU: f64 = 6_300_000.0;
+  let max_width_emu = max_width_emu.max(1) as f64;
   let width_emu = width as f64 * EMU_PER_PIXEL;
   let height_emu = height as f64 * EMU_PER_PIXEL;
-  let scale = if width_emu > MAX_WIDTH_EMU {
-    MAX_WIDTH_EMU / width_emu
+  let scale = if width_emu > max_width_emu {
+    max_width_emu / width_emu
   } else {
     1.0
   };
@@ -1778,20 +2520,10 @@ fn toc_block(
   cfg: &DocxConfig,
   docx: &mut DocxRenderContext<'_>,
 ) -> Vec<BodyChoice> {
-  let mut out = vec![
-    BodyChoice::Paragraph(Box::new(toc_heading_paragraph("Contents", &docx.styles))),
-    BodyChoice::Paragraph(Box::new(Paragraph {
-      paragraph_choice: vec![
-        ParagraphChoice::WRun(Box::new(field_char_run(FieldCharValues::Begin, true))),
-        ParagraphChoice::WRun(Box::new(field_code_run(&format!(
-          r#" TOC \o "1-{}" \h \z \u "#,
-          cfg.toc_depth()
-        )))),
-        ParagraphChoice::WRun(Box::new(field_char_run(FieldCharValues::Separate, false))),
-      ],
-      ..Default::default()
-    })),
-  ];
+  let mut out = vec![BodyChoice::Paragraph(Box::new(toc_heading_paragraph(
+    &docx.styles.toc_heading_text,
+    &docx.styles,
+  )))];
 
   for chapter in ctx
     .book
@@ -1803,13 +2535,6 @@ fn toc_block(
     }
   }
 
-  out.push(BodyChoice::Paragraph(Box::new(Paragraph {
-    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(field_char_run(
-      FieldCharValues::End,
-      false,
-    )))],
-    ..Default::default()
-  })));
   out.push(BodyChoice::Paragraph(Box::new(page_break_paragraph())));
   out
 }
@@ -1835,43 +2560,96 @@ fn toc_entry_paragraph(
 
   Some(Paragraph {
     paragraph_properties: Some(Box::new(toc_entry_properties(level, &docx.styles))),
-    paragraph_choice: vec![ParagraphChoice::Hyperlink(Box::new(Hyperlink {
-      anchor: Some(bookmark),
-      history: Some(OnOffValue::True),
-      hyperlink_choice: vec![
-        HyperlinkChoice::WRun(Box::new(text_run(
-          &title,
-          RunStyle {
-            hyperlink: true,
-            ..Default::default()
-          },
-        ))),
-        HyperlinkChoice::WRun(Box::new(tab_run())),
-      ],
-      ..Default::default()
-    }))],
+    paragraph_choice: toc_entry_choices(&title, &bookmark, &docx.styles),
     ..Default::default()
   })
 }
 
 fn toc_entry_properties(level: usize, styles: &DocxStyles) -> ParagraphProperties {
   let mut properties = paragraph_properties(styles.toc_entry(level));
-  properties.indentation = Some(Indentation {
-    left: Some(signed_twips(((level.saturating_sub(1)) * 420) as i64)),
-    ..Default::default()
-  });
   properties.tabs = Some(Tabs {
     tab_stop: vec![TabStop {
       val: TabStopValues::Right,
       leader: Some(TabStopLeaderCharValues::Dot),
-      position: signed_twips(9000),
+      position: signed_twips(styles.toc_tab_position),
     }],
   });
+  if level > 3 {
+    properties.indentation = Some(Indentation {
+      left: Some(signed_twips(((level.saturating_sub(1)) * 220) as i64)),
+      ..Default::default()
+    });
+  }
   properties
 }
 
-fn field_char_run(field_char_type: FieldCharValues, dirty: bool) -> Run {
+fn toc_entry_choices(title: &str, bookmark: &str, styles: &DocxStyles) -> Vec<ParagraphChoice> {
+  vec![
+    ParagraphChoice::WRun(Box::new(toc_field_char_run(
+      FieldCharValues::Begin,
+      true,
+      styles,
+    ))),
+    ParagraphChoice::WRun(Box::new(toc_field_code_run(
+      &format!(r#" HYPERLINK \l {bookmark} "#),
+      styles,
+    ))),
+    ParagraphChoice::WRun(Box::new(toc_field_char_run(
+      FieldCharValues::Separate,
+      false,
+      styles,
+    ))),
+    ParagraphChoice::WRun(Box::new(toc_text_run(title, styles))),
+    ParagraphChoice::WRun(Box::new(toc_tab_run(styles))),
+    ParagraphChoice::WRun(Box::new(toc_field_char_run(
+      FieldCharValues::Begin,
+      true,
+      styles,
+    ))),
+    ParagraphChoice::WRun(Box::new(toc_field_code_run(
+      &format!(r#" PAGEREF {bookmark} \h "#),
+      styles,
+    ))),
+    ParagraphChoice::WRun(Box::new(toc_field_char_run(
+      FieldCharValues::Separate,
+      false,
+      styles,
+    ))),
+    ParagraphChoice::WRun(Box::new(toc_field_char_run(
+      FieldCharValues::End,
+      false,
+      styles,
+    ))),
+    ParagraphChoice::WRun(Box::new(toc_field_char_run(
+      FieldCharValues::End,
+      false,
+      styles,
+    ))),
+  ]
+}
+
+fn toc_text_run(text: &str, styles: &DocxStyles) -> Run {
   Run {
+    run_properties: Some(Box::new(toc_run_properties(styles))),
+    run_choice: vec![RunChoice::Text(Box::new(text_node(
+      text,
+      text_needs_preserve(text),
+    )))],
+    ..Default::default()
+  }
+}
+
+fn toc_tab_run(styles: &DocxStyles) -> Run {
+  Run {
+    run_properties: Some(Box::new(toc_run_properties(styles))),
+    run_choice: vec![RunChoice::TabChar],
+    ..Default::default()
+  }
+}
+
+fn toc_field_char_run(field_char_type: FieldCharValues, dirty: bool, styles: &DocxStyles) -> Run {
+  Run {
+    run_properties: Some(Box::new(toc_run_properties(styles))),
     run_choice: vec![RunChoice::FieldChar(Box::new(FieldChar {
       field_char_type,
       dirty: dirty.then_some(OnOffValue::True),
@@ -1881,9 +2659,25 @@ fn field_char_run(field_char_type: FieldCharValues, dirty: bool) -> Run {
   }
 }
 
-fn field_code_run(instruction: &str) -> Run {
+fn toc_field_code_run(instruction: &str, styles: &DocxStyles) -> Run {
   Run {
+    run_properties: Some(Box::new(toc_run_properties(styles))),
     run_choice: vec![RunChoice::FieldCode(Box::new(field_code_node(instruction)))],
+    ..Default::default()
+  }
+}
+
+fn toc_run_properties(styles: &DocxStyles) -> RunProperties {
+  RunProperties {
+    run_properties_choice: vec![
+      RunPropertiesChoice::RunFonts(Box::new(styles.toc_run_fonts.clone())),
+      RunPropertiesChoice::FontSize(Box::new(FontSize {
+        val: styles.toc_font_size.clone(),
+      })),
+      RunPropertiesChoice::FontSizeComplexScript(Box::new(FontSizeComplexScript {
+        val: styles.toc_font_size.clone(),
+      })),
+    ],
     ..Default::default()
   }
 }
@@ -1897,6 +2691,16 @@ fn page_break_paragraph() -> Paragraph {
       }))],
       ..Default::default()
     }))],
+    ..Default::default()
+  }
+}
+
+fn section_break_paragraph(section_properties: Box<SectionProperties>) -> Paragraph {
+  Paragraph {
+    paragraph_properties: Some(Box::new(ParagraphProperties {
+      section_properties: Some(section_properties),
+      ..Default::default()
+    })),
     ..Default::default()
   }
 }
@@ -2161,6 +2965,8 @@ fn block_properties(
   quote_depth: usize,
   list_depth: Option<usize>,
   numbering_id: Option<i32>,
+  has_image: bool,
+  styles: &DocxStyles,
 ) -> ParagraphProperties {
   let mut properties = style.map_or_else(ParagraphProperties::default, paragraph_properties);
 
@@ -2170,6 +2976,60 @@ fn block_properties(
       left: Some(signed_twips((indent_depth * 420) as i64)),
       ..Default::default()
     });
+  }
+
+  if matches!(kind, ParagraphKind::Normal | ParagraphKind::Quote) && indent_depth == 0 {
+    properties.indentation = Some(Indentation {
+      first_line: Some(twips(420)),
+      ..Default::default()
+    });
+  }
+  if has_image {
+    properties.indentation = None;
+    properties.justification = Some(Justification {
+      val: JustificationValues::Center,
+    });
+  } else if matches!(
+    kind,
+    ParagraphKind::Normal | ParagraphKind::List | ParagraphKind::Quote
+  ) {
+    properties.justification = Some(Justification {
+      val: JustificationValues::Both,
+    });
+  }
+  if matches!(
+    kind,
+    ParagraphKind::Normal | ParagraphKind::List | ParagraphKind::Quote
+  ) {
+    properties.spacing_between_lines = Some(SpacingBetweenLines {
+      before: Some(twips(0)),
+      after: Some(twips(0)),
+      line: Some(signed_twips(240)),
+      line_rule: Some(LineSpacingRuleValues::Auto),
+      ..Default::default()
+    });
+    properties.paragraph_mark_run_properties = Some(Box::new(paragraph_mark_run_properties(
+      &styles.body_font_size,
+      false,
+      &styles.body_run_fonts,
+    )));
+  }
+  if matches!(kind, ParagraphKind::Heading) {
+    properties.justification = Some(Justification {
+      val: JustificationValues::Both,
+    });
+    properties.spacing_between_lines = Some(SpacingBetweenLines {
+      before: Some(twips(0)),
+      after: Some(twips(0)),
+      line: Some(signed_twips(240)),
+      line_rule: Some(LineSpacingRuleValues::Auto),
+      ..Default::default()
+    });
+    properties.paragraph_mark_run_properties = Some(Box::new(paragraph_mark_run_properties(
+      &styles.body_font_size,
+      true,
+      &styles.body_run_fonts,
+    )));
   }
 
   if let (Some(depth), Some(numbering_id)) = (list_depth, numbering_id) {
@@ -2189,9 +3049,9 @@ fn block_properties(
   properties
 }
 
-fn text_run(text: &str, style: RunStyle) -> Run {
+fn text_run(text: &str, style: RunStyle, styles: &DocxStyles) -> Run {
   Run {
-    run_properties: run_properties(style).map(Box::new),
+    run_properties: run_properties(style, styles).map(Box::new),
     run_choice: vec![RunChoice::Text(Box::new(text_node(
       text,
       text_needs_preserve(text),
@@ -2200,19 +3060,49 @@ fn text_run(text: &str, style: RunStyle) -> Run {
   }
 }
 
-fn tab_run() -> Run {
-  Run {
-    run_choice: vec![RunChoice::TabChar],
-    ..Default::default()
-  }
-}
-
-fn run_properties(style: RunStyle) -> Option<RunProperties> {
-  if !(style.bold || style.italic || style.strike || style.code || style.hyperlink) {
+fn run_properties(style: RunStyle, styles: &DocxStyles) -> Option<RunProperties> {
+  if !(style.bold
+    || style.italic
+    || style.strike
+    || style.code
+    || style.hyperlink
+    || style.base != RunBase::None)
+  {
     return None;
   }
 
   let mut choices = Vec::new();
+  match style.base {
+    RunBase::Body => {
+      choices.push(RunPropertiesChoice::RunFonts(Box::new(
+        styles.body_run_fonts.clone(),
+      )));
+      choices.push(RunPropertiesChoice::FontSize(Box::new(FontSize {
+        val: styles.body_font_size.clone(),
+      })));
+      choices.push(RunPropertiesChoice::FontSizeComplexScript(Box::new(
+        FontSizeComplexScript {
+          val: styles.body_font_size.clone(),
+        },
+      )));
+    }
+    RunBase::Heading(level) => {
+      let level = level.clamp(1, 9);
+      choices.push(RunPropertiesChoice::RunFonts(Box::new(
+        styles.heading_run_fonts[level - 1].clone(),
+      )));
+      choices.push(RunPropertiesChoice::Bold(Box::default()));
+      choices.push(RunPropertiesChoice::BoldComplexScript(Box::default()));
+      let size = &styles.heading_font_sizes[level - 1];
+      choices.push(RunPropertiesChoice::FontSize(Box::new(FontSize {
+        val: size.clone(),
+      })));
+      choices.push(RunPropertiesChoice::FontSizeComplexScript(Box::new(
+        FontSizeComplexScript { val: size.clone() },
+      )));
+    }
+    RunBase::None => {}
+  }
   if style.bold {
     choices.push(RunPropertiesChoice::Bold(Box::default()));
   }
@@ -2244,12 +3134,49 @@ fn run_properties(style: RunStyle) -> Option<RunProperties> {
   })
 }
 
+fn paragraph_mark_run_properties(
+  size: &str,
+  bold: bool,
+  fonts: &RunFonts,
+) -> ParagraphMarkRunProperties {
+  let mut choices = vec![
+    ParagraphMarkRunPropertiesChoice2::RunFonts(Box::new(fonts.clone())),
+    ParagraphMarkRunPropertiesChoice2::FontSize(Box::new(FontSize {
+      val: size.to_string(),
+    })),
+    ParagraphMarkRunPropertiesChoice2::FontSizeComplexScript(Box::new(FontSizeComplexScript {
+      val: size.to_string(),
+    })),
+  ];
+  if bold {
+    choices.push(ParagraphMarkRunPropertiesChoice2::Bold(Box::default()));
+    choices.push(ParagraphMarkRunPropertiesChoice2::BoldComplexScript(
+      Box::default(),
+    ));
+  }
+
+  ParagraphMarkRunProperties {
+    paragraph_mark_run_properties_choice2: choices,
+    ..Default::default()
+  }
+}
+
 fn consolas_fonts() -> RunFonts {
   RunFonts {
     ascii: Some("Consolas".to_string()),
     high_ansi: Some("Consolas".to_string()),
     east_asia: Some("Consolas".to_string()),
     complex_script: Some("Consolas".to_string()),
+    ..Default::default()
+  }
+}
+
+fn default_body_fonts() -> RunFonts {
+  RunFonts {
+    ascii: Some("Arial".to_string()),
+    high_ansi: Some("Arial".to_string()),
+    east_asia: Some("微软雅黑".to_string()),
+    complex_script: Some("微软雅黑".to_string()),
     ..Default::default()
   }
 }
