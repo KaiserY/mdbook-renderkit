@@ -10,28 +10,37 @@ use ooxmlsdk::parts::main_document_part::MainDocumentPart;
 use ooxmlsdk::parts::numbering_definitions_part::NumberingDefinitionsPart;
 use ooxmlsdk::parts::wordprocessing_document::WordprocessingDocument;
 use ooxmlsdk::schemas::opc_relationships::TargetMode;
+use ooxmlsdk::schemas::schemas_openxmlformats_org_drawingml_2006_main as a;
+use ooxmlsdk::schemas::schemas_openxmlformats_org_drawingml_2006_picture as pic;
+use ooxmlsdk::schemas::schemas_openxmlformats_org_drawingml_2006_wordprocessing_drawing as wp;
 use ooxmlsdk::schemas::schemas_openxmlformats_org_wordprocessingml_2006_main::{
   AbstractNum, AbstractNumId, Body, BodyChoice, BookmarkEnd, BookmarkStart, BorderValues,
-  BottomBorder, Break, BreakValues, Color, Document, FieldChar, FieldCharValues, FieldCode,
-  FontSize, FontSizeComplexScript, Hyperlink, HyperlinkChoice, Indentation, InsideHorizontalBorder,
+  BottomBorder, BottomMargin, Break, BreakValues, Color, Document, Drawing, DrawingChoice,
+  FieldChar, FieldCharValues, FieldCode, FontSize, FontSizeComplexScript, GridColumn,
+  HeightRuleValues, Hyperlink, HyperlinkChoice, Indentation, InsideHorizontalBorder,
   InsideVerticalBorder, Justification, JustificationValues, LeftBorder, Level, LevelJustification,
   LevelJustificationValues, LevelOverride, LevelSuffix, LevelSuffixValues, LevelText,
   LineSpacingRuleValues, MultiLevelType, MultiLevelValues, NumberFormatValues, Numbering,
   NumberingFormat, NumberingId, NumberingInstance, NumberingLevelReference, NumberingProperties,
   Paragraph, ParagraphChoice, ParagraphProperties, ParagraphStyleId, RightBorder, Run, RunChoice,
-  RunFonts, RunProperties, RunPropertiesChoice, RunStyle as WordRunStyle, Shading,
-  ShadingPatternValues, SpacingBetweenLines, StartNumberingValue, StartOverrideNumberingValue,
-  TabStop, TabStopLeaderCharValues, TabStopValues, Table, TableBorders, TableCell, TableCellChoice,
-  TableCellProperties, TableCellWidth, TableChoice2, TableProperties, TableRow, TableRowChoice,
-  TableStyle, TableWidth, TableWidthUnitValues, Tabs, Text, TextType, TopBorder, Underline,
+  RunFonts, RunProperties, RunPropertiesChoice, RunStyle as WordRunStyle, SectionProperties,
+  Shading, ShadingPatternValues, SpacingBetweenLines, StartNumberingValue,
+  StartOverrideNumberingValue, StyleValues, TabStop, TabStopLeaderCharValues, TabStopValues, Table,
+  TableBorders, TableCell, TableCellBorders, TableCellChoice, TableCellLeftMargin, TableCellMargin,
+  TableCellMarginDefault, TableCellProperties, TableCellRightMargin, TableCellVerticalAlignment,
+  TableCellWidth, TableChoice2, TableGrid, TableJustification, TableLayout, TableLayoutValues,
+  TableProperties, TableRow, TableRowAlignmentValues, TableRowChoice, TableRowHeight,
+  TableRowProperties, TableRowPropertiesChoice, TableStyle, TableVerticalAlignmentValues,
+  TableWidth, TableWidthUnitValues, Tabs, Text, TextType, TopBorder, TopMargin, Underline,
   UnderlineValues,
 };
 use ooxmlsdk::schemas::www_w3_org_xml_1998_namespace::SpaceProcessingModeValues;
-use ooxmlsdk::sdk::WordprocessingDocumentType;
+use ooxmlsdk::sdk::{SdkPart, WordprocessingDocumentType};
 use ooxmlsdk::simple_type::{
-  MeasurementOrPercentValue, OnOffValue, SignedTwipsMeasureValue, TwipsMeasureValue,
+  BooleanValue, CoordinateValue, MeasurementOrPercentValue, OnOffValue, SignedTwipsMeasureValue,
+  TwipsMeasureValue,
 };
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SyntectColor, FontStyle as SyntectFontStyle, Style, Theme};
 use syntect::parsing::SyntaxSet;
@@ -65,6 +74,10 @@ fn twips(value: u64) -> TwipsMeasureValue {
   TwipsMeasureValue::Twips(value)
 }
 
+fn dxa(value: i64) -> TwipsMeasureValue {
+  TwipsMeasureValue::Twips(value.max(0) as u64)
+}
+
 fn signed_twips(value: i64) -> SignedTwipsMeasureValue {
   SignedTwipsMeasureValue::Twips(value)
 }
@@ -72,6 +85,7 @@ fn signed_twips(value: i64) -> SignedTwipsMeasureValue {
 #[derive(Debug, serde::Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct DocxConfig {
+  template: Option<PathBuf>,
   section_number: bool,
   toc: bool,
   toc_depth: usize,
@@ -82,6 +96,7 @@ struct DocxConfig {
 impl Default for DocxConfig {
   fn default() -> Self {
     Self {
+      template: None,
       section_number: false,
       toc: true,
       toc_depth: 3,
@@ -94,6 +109,61 @@ impl Default for DocxConfig {
 impl DocxConfig {
   fn toc_depth(&self) -> usize {
     self.toc_depth.clamp(1, 9)
+  }
+}
+
+#[derive(Clone, Debug)]
+struct DocxStyles {
+  headings: [String; 9],
+  title: String,
+  toc_heading: String,
+  toc_entries: [String; 9],
+  code: String,
+  list: String,
+  quote: String,
+  table: String,
+  hyperlink: String,
+}
+
+struct DocxPackageParts<'a> {
+  main_part: &'a MainDocumentPart,
+  numbering_part: &'a NumberingDefinitionsPart,
+  styles: &'a DocxStyles,
+  section_properties: Option<Box<SectionProperties>>,
+}
+
+impl Default for DocxStyles {
+  fn default() -> Self {
+    Self {
+      headings: std::array::from_fn(|index| format!("Heading{}", index + 1)),
+      title: "Title".to_string(),
+      toc_heading: "TOCHeading".to_string(),
+      toc_entries: std::array::from_fn(|index| format!("TOC{}", index + 1)),
+      code: "NoSpacing".to_string(),
+      list: "ListParagraph".to_string(),
+      quote: "Quote".to_string(),
+      table: "TableGrid".to_string(),
+      hyperlink: "Hyperlink".to_string(),
+    }
+  }
+}
+
+impl DocxStyles {
+  fn heading(&self, level: usize) -> &str {
+    &self.headings[level.clamp(1, 9) - 1]
+  }
+
+  fn toc_entry(&self, level: usize) -> &str {
+    &self.toc_entries[level.clamp(1, 9) - 1]
+  }
+
+  fn block_style(&self, kind: ParagraphKind) -> Option<&str> {
+    match kind {
+      ParagraphKind::Code => Some(&self.code),
+      ParagraphKind::List => Some(&self.list),
+      ParagraphKind::Quote => Some(&self.quote),
+      ParagraphKind::Normal => None,
+    }
   }
 }
 
@@ -122,24 +192,234 @@ fn output_filename(ctx: &RenderContext, extension: &str) -> PathBuf {
 }
 
 fn write_docx(ctx: &RenderContext, path: &Path) -> Result<()> {
+  let cfg = load_config(ctx)?;
+  if let Some(template) = &cfg.template {
+    write_docx_from_template(ctx, &cfg, template, path)
+  } else {
+    write_docx_from_scratch(ctx, &cfg, path)
+  }
+}
+
+fn write_docx_from_scratch(ctx: &RenderContext, cfg: &DocxConfig, path: &Path) -> Result<()> {
   let mut package = WordprocessingDocument::create(WordprocessingDocumentType::Document);
   let main_part = package.add_main_document_part()?;
-  let cfg = load_config(ctx)?;
-  let numbering_part = package.add_new_part_auto_id::<NumberingDefinitionsPart>()?;
-  let numbering_part = main_part.add_part(&mut package, numbering_part)?;
+  let numbering_part = ensure_numbering_part(&mut package, &main_part)?;
+  let styles = DocxStyles::default();
+  write_docx_package(
+    ctx,
+    cfg,
+    path,
+    &mut package,
+    DocxPackageParts {
+      main_part: &main_part,
+      numbering_part: &numbering_part,
+      styles: &styles,
+      section_properties: None,
+    },
+  )
+}
 
-  let (document, ordered_lists) = {
-    let mut docx = DocxRenderContext::new(&mut package, &main_part, &cfg);
-    let document = document(ctx, &cfg, &mut docx)?;
-    (document, docx.ordered_lists)
-  };
-  main_part.set_root_element(&mut package, document)?;
-  numbering_part.set_root_element(&mut package, numbering_definitions(&ordered_lists))?;
+fn write_docx_from_template(
+  ctx: &RenderContext,
+  cfg: &DocxConfig,
+  template: &Path,
+  path: &Path,
+) -> Result<()> {
+  let template_path = ctx.root.join(template);
+  eprintln!("renderkit: using DOCX template {}", template_path.display());
+
+  let mut package = WordprocessingDocument::create_from_template(&template_path)
+    .with_context(|| format!("failed to read DOCX template {}", template_path.display()))?;
+  let main_part = package.main_document_part()?;
+  let section_properties = template_section_properties(&mut package, &main_part)?;
+  let numbering_part = ensure_numbering_part(&mut package, &main_part)?;
+  let styles = resolve_docx_styles(&mut package, &main_part);
+
+  write_docx_package(
+    ctx,
+    cfg,
+    path,
+    &mut package,
+    DocxPackageParts {
+      main_part: &main_part,
+      numbering_part: &numbering_part,
+      styles: &styles,
+      section_properties,
+    },
+  )
+}
+
+fn write_docx_package(
+  ctx: &RenderContext,
+  cfg: &DocxConfig,
+  path: &Path,
+  package: &mut WordprocessingDocument,
+  parts: DocxPackageParts<'_>,
+) -> Result<()> {
+  let (document, ordered_lists) = render_document(
+    ctx,
+    cfg,
+    package,
+    parts.main_part,
+    parts.styles,
+    parts.section_properties,
+  )?;
+  parts.main_part.set_root_element(package, document)?;
+  parts
+    .numbering_part
+    .set_root_element(package, numbering_definitions(&ordered_lists))?;
 
   let file = File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
   package.save(file)?;
-
   Ok(())
+}
+
+fn render_document(
+  ctx: &RenderContext,
+  cfg: &DocxConfig,
+  package: &mut WordprocessingDocument,
+  main_part: &MainDocumentPart,
+  styles: &DocxStyles,
+  section_properties: Option<Box<SectionProperties>>,
+) -> Result<(Document, Vec<OrderedListDefinition>)> {
+  let mut docx = DocxRenderContext::new(ctx, package, main_part, cfg, styles.clone());
+  let document = document(ctx, cfg, &mut docx, section_properties)?;
+  Ok((document, docx.ordered_lists))
+}
+
+fn ensure_numbering_part(
+  package: &mut WordprocessingDocument,
+  main_part: &MainDocumentPart,
+) -> Result<NumberingDefinitionsPart> {
+  if let Some(numbering_part) = main_part.numbering_definitions_part(package) {
+    return Ok(numbering_part);
+  }
+
+  let numbering_part = package.add_new_part_auto_id::<NumberingDefinitionsPart>()?;
+  Ok(main_part.add_part(package, numbering_part)?)
+}
+
+fn resolve_docx_styles(
+  package: &mut WordprocessingDocument,
+  main_part: &MainDocumentPart,
+) -> DocxStyles {
+  let mut styles = DocxStyles::default();
+  let Some(style_part) = main_part.style_definitions_part(package) else {
+    return styles;
+  };
+  let Ok(root) = style_part.root_element(package) else {
+    return styles;
+  };
+
+  let mut names = HashMap::new();
+  let mut paragraph_outline = HashMap::new();
+  for style in &root.style {
+    let Some(style_id) = style.style_id.as_ref() else {
+      continue;
+    };
+    if let Some(name) = style.style_name.as_ref() {
+      names.insert(normalize_style_name(&name.val), style_id.clone());
+    }
+    if style.r#type == Some(StyleValues::Paragraph)
+      && let Some(outline_level) = style
+        .style_paragraph_properties
+        .as_ref()
+        .and_then(|properties| properties.outline_level.as_ref())
+        .map(|level| level.val)
+    {
+      paragraph_outline
+        .entry(outline_level)
+        .or_insert_with(|| style_id.clone());
+    }
+  }
+
+  for level in 1..=9 {
+    let key = format!("heading {level}");
+    if let Some(style_id) = names
+      .get(&key)
+      .or_else(|| paragraph_outline.get(&((level - 1) as i32)))
+    {
+      styles.headings[level - 1] = style_id.clone();
+    }
+    let key = format!("toc {level}");
+    if let Some(style_id) = names.get(&key) {
+      styles.toc_entries[level - 1] = style_id.clone();
+    }
+  }
+
+  if let Some(style_id) = names.get("title") {
+    styles.title = style_id.clone();
+  }
+  if let Some(style_id) = names.get("toc heading") {
+    styles.toc_heading = style_id.clone();
+  }
+  if let Some(style_id) = names.get("list paragraph") {
+    styles.list = style_id.clone();
+  }
+  if let Some(style_id) = names.get("quote") {
+    styles.quote = style_id.clone();
+  }
+  if let Some(style_id) = names.get("no spacing").or_else(|| names.get("nospacing")) {
+    styles.code = style_id.clone();
+  }
+  if let Some(style_id) = names.get("无间隔1").or_else(|| names.get("无间隔")) {
+    styles.code = style_id.clone();
+  }
+  if let Some(style_id) = names
+    .get("normal table")
+    .or_else(|| names.get("table grid"))
+  {
+    styles.table = style_id.clone();
+  }
+  if let Some(style_id) = names.get("hyperlink") {
+    styles.hyperlink = style_id.clone();
+  }
+
+  styles
+}
+
+fn normalize_style_name(name: &str) -> String {
+  name
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase()
+}
+
+fn template_section_properties(
+  package: &mut WordprocessingDocument,
+  main_part: &MainDocumentPart,
+) -> Result<Option<Box<SectionProperties>>> {
+  let document = main_part.root_element(package)?;
+  let Some(body) = document.body.as_ref() else {
+    return Ok(None);
+  };
+
+  let mut section_properties = body.section_properties.clone();
+  let referenced_section_properties = body.body_choice.iter().find_map(|choice| {
+    let BodyChoice::Paragraph(paragraph) = choice else {
+      return None;
+    };
+    paragraph
+      .paragraph_properties
+      .as_ref()
+      .and_then(|properties| properties.section_properties.as_ref())
+      .filter(|properties| !properties.section_properties_choice.is_empty())
+      .cloned()
+  });
+
+  if let Some(referenced_section_properties) = referenced_section_properties {
+    if let Some(section_properties) = section_properties.as_mut() {
+      if section_properties.section_properties_choice.is_empty() {
+        section_properties.section_properties_choice =
+          referenced_section_properties.section_properties_choice;
+      }
+    } else {
+      section_properties = Some(referenced_section_properties);
+    }
+  }
+
+  Ok(section_properties)
 }
 
 fn load_config(ctx: &RenderContext) -> Result<DocxConfig> {
@@ -154,14 +434,19 @@ fn document(
   ctx: &RenderContext,
   cfg: &DocxConfig,
   docx: &mut DocxRenderContext<'_>,
+  section_properties: Option<Box<SectionProperties>>,
 ) -> Result<Document> {
-  let mut body = Body::default();
+  let mut body = Body {
+    section_properties,
+    ..Default::default()
+  };
 
   if let Some(title) = &ctx.config.book.title {
     body
       .body_choice
       .push(BodyChoice::Paragraph(Box::new(cover_title_paragraph(
         title,
+        &docx.styles,
       ))));
     body
       .body_choice
@@ -179,7 +464,12 @@ fn document(
     if body.body_choice.len() == before {
       let bookmark = docx.chapter_bookmark(chapter);
       body.body_choice.push(BodyChoice::Paragraph(Box::new(
-        heading_paragraph_with_bookmark(chapter_level(chapter), &chapter.name, bookmark),
+        heading_paragraph_with_bookmark(
+          chapter_level(chapter),
+          &chapter.name,
+          bookmark,
+          &docx.styles,
+        ),
       )));
     }
     if chapters.peek().is_some() {
@@ -198,6 +488,15 @@ fn document(
       XmlNamespaceDecl::new(
         "r",
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+      ),
+      XmlNamespaceDecl::new(
+        "wp",
+        "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+      ),
+      XmlNamespaceDecl::new("a", "http://schemas.openxmlformats.org/drawingml/2006/main"),
+      XmlNamespaceDecl::new(
+        "pic",
+        "http://schemas.openxmlformats.org/drawingml/2006/picture",
       ),
     ],
     body: Some(Box::new(body)),
@@ -229,6 +528,7 @@ fn chapter_body(
   let mut out = Vec::new();
   let mut paragraph = ParagraphBuilder::default();
   let mut code_block: Option<(String, String)> = None;
+  let mut image: Option<(String, String)> = None;
   let mut lists: Vec<ListState> = Vec::new();
   let mut quote_depth = 0usize;
   let mut table: Option<TableBuilder> = None;
@@ -248,6 +548,25 @@ fn chapter_body(
       continue;
     }
 
+    if let Some((_dest_url, alt)) = &mut image {
+      match event {
+        Event::End(TagEnd::Image) => {
+          let (dest_url, alt) = image.take().expect("checked above");
+          if let Some(run) = docx.image_run(chapter, &dest_url, &alt)? {
+            paragraph.push_run_node(run);
+          } else {
+            paragraph.push_text("[image: ");
+            paragraph.push_text(&dest_url);
+            paragraph.push_text("]");
+          }
+        }
+        Event::Text(text) | Event::Code(text) => alt.push_str(&text),
+        Event::SoftBreak | Event::HardBreak => alt.push(' '),
+        _ => {}
+      }
+      continue;
+    }
+
     match event {
       Event::Start(Tag::Paragraph) => {
         let kind = if quote_depth > 0 {
@@ -255,7 +574,7 @@ fn chapter_body(
         } else {
           ParagraphKind::Normal
         };
-        paragraph = ParagraphBuilder::for_block(kind, quote_depth, None)
+        paragraph = ParagraphBuilder::for_block(kind, quote_depth, None, &docx.styles)
       }
       Event::End(TagEnd::Paragraph) => paragraph.flush_to(&mut out, &mut table),
       Event::Start(Tag::Heading { level, .. }) => {
@@ -265,7 +584,7 @@ fn chapter_body(
         } else {
           markdown_level
         };
-        paragraph = ParagraphBuilder::with_heading(level);
+        paragraph = ParagraphBuilder::with_heading(level, &docx.styles);
         paragraph.bookmark = chapter_bookmark.take();
       }
       Event::End(TagEnd::Heading(_)) => paragraph.flush_to(&mut out, &mut table),
@@ -292,7 +611,8 @@ fn chapter_body(
           .last_mut()
           .map(|list| list.numbering_id())
           .unwrap_or(BULLET_NUM_ID);
-        paragraph = ParagraphBuilder::for_block(ParagraphKind::List, quote_depth, Some(depth));
+        paragraph =
+          ParagraphBuilder::for_block(ParagraphKind::List, quote_depth, Some(depth), &docx.styles);
         paragraph.list_numbering_id = Some(marker);
       }
       Event::End(TagEnd::Item) => paragraph.flush_to(&mut out, &mut table),
@@ -308,8 +628,8 @@ fn chapter_body(
         };
         code_block = Some((lang, String::new()));
       }
-      Event::Start(Tag::Table(_)) => {
-        table = Some(TableBuilder::default());
+      Event::Start(Tag::Table(alignments)) => {
+        table = Some(TableBuilder::new(&docx.styles, alignments.to_vec()));
       }
       Event::End(TagEnd::Table) => {
         if let Some(table) = table.take() {
@@ -319,10 +639,12 @@ fn chapter_body(
       Event::Start(Tag::TableHead) => {
         if let Some(table) = &mut table {
           table.in_head = true;
+          table.start_row();
         }
       }
       Event::End(TagEnd::TableHead) => {
         if let Some(table) = &mut table {
+          table.end_row();
           table.in_head = false;
         }
       }
@@ -358,9 +680,7 @@ fn chapter_body(
         paragraph.link_stack.pop();
       }
       Event::Start(Tag::Image { dest_url, .. }) => {
-        paragraph.push_text("[image: ");
-        paragraph.push_text(&dest_url);
-        paragraph.push_text("]");
+        image = Some((dest_url.to_string(), String::new()));
       }
       Event::Code(text) => {
         paragraph.push_inline_code(
@@ -402,32 +722,42 @@ fn chapter_body(
 }
 
 struct DocxRenderContext<'a> {
+  source_dir: PathBuf,
   package: &'a mut WordprocessingDocument,
   main_part: &'a MainDocumentPart,
+  styles: DocxStyles,
   highlighter: CodeHighlighter,
   ordered_lists: Vec<OrderedListDefinition>,
   hyperlinks: HashMap<String, String>,
+  images: HashMap<PathBuf, ImageRef>,
   bookmarks: HashMap<PathBuf, String>,
   bookmark_ids: HashMap<String, String>,
   next_bookmark_id: usize,
+  next_drawing_id: u32,
   next_numbering_id: i32,
 }
 
 impl<'a> DocxRenderContext<'a> {
   fn new(
+    ctx: &RenderContext,
     package: &'a mut WordprocessingDocument,
     main_part: &'a MainDocumentPart,
     cfg: &DocxConfig,
+    styles: DocxStyles,
   ) -> Self {
     Self {
+      source_dir: ctx.source_dir(),
       package,
       main_part,
+      styles,
       highlighter: CodeHighlighter::new(cfg),
       ordered_lists: Vec::new(),
       hyperlinks: HashMap::new(),
+      images: HashMap::new(),
       bookmarks: HashMap::new(),
       bookmark_ids: HashMap::new(),
       next_bookmark_id: 1,
+      next_drawing_id: 1,
       next_numbering_id: FIRST_ORDERED_NUM_ID,
     }
   }
@@ -463,6 +793,54 @@ impl<'a> DocxRenderContext<'a> {
       .to_string();
     self.hyperlinks.insert(url.to_string(), id.clone());
     Ok(LinkTarget::External(id))
+  }
+
+  fn image_run(&mut self, chapter: &Chapter, url: &str, alt: &str) -> Result<Option<Run>> {
+    if is_remote_url(url) {
+      return Ok(None);
+    }
+    let Some(image_path) = local_asset_path(chapter, &self.source_dir, url) else {
+      return Ok(None);
+    };
+    if !image_path.exists() {
+      return Ok(None);
+    }
+
+    let image = if let Some(image) = self.images.get(&image_path) {
+      image.clone()
+    } else {
+      let data = fs::read(&image_path)
+        .with_context(|| format!("failed to read image {}", image_path.display()))?;
+      let Some((width, height)) = image_dimensions(&data) else {
+        return Ok(None);
+      };
+      let Some(content_type) = image_content_type(&image_path, &data) else {
+        return Ok(None);
+      };
+      let part = self.main_part.add_image_part(self.package, content_type)?;
+      part.set_data(self.package, data)?;
+      let relationship_id = part
+        .relationship_id()
+        .context("image part missing relationship id")?
+        .to_string();
+      let image = ImageRef {
+        relationship_id,
+        width,
+        height,
+        alt: alt.to_string(),
+      };
+      self.images.insert(image_path, image.clone());
+      image
+    };
+
+    let drawing_id = self.next_drawing_id;
+    self.next_drawing_id += 1;
+    Ok(Some(Run {
+      run_choice: vec![RunChoice::Drawing(Box::new(image_drawing(
+        drawing_id, &image,
+      )))],
+      ..Default::default()
+    }))
   }
 
   fn chapter_bookmark(&mut self, chapter: &Chapter) -> Option<BookmarkRef> {
@@ -603,6 +981,14 @@ struct BookmarkRef {
 }
 
 #[derive(Clone, Debug)]
+struct ImageRef {
+  relationship_id: String,
+  width: u32,
+  height: u32,
+  alt: String,
+}
+
+#[derive(Clone, Debug)]
 struct ListState {
   numbering_id: i32,
 }
@@ -665,16 +1051,21 @@ struct ParagraphBuilder {
 }
 
 impl ParagraphBuilder {
-  fn with_heading(level: usize) -> Self {
+  fn with_heading(level: usize, styles: &DocxStyles) -> Self {
     Self {
-      paragraph_style: Some(format!("Heading{}", level.clamp(1, 9))),
+      paragraph_style: Some(styles.heading(level).to_string()),
       ..Default::default()
     }
   }
 
-  fn for_block(kind: ParagraphKind, quote_depth: usize, list_depth: Option<usize>) -> Self {
+  fn for_block(
+    kind: ParagraphKind,
+    quote_depth: usize,
+    list_depth: Option<usize>,
+    styles: &DocxStyles,
+  ) -> Self {
     Self {
-      paragraph_style: paragraph_style_for_kind(kind).map(str::to_string),
+      paragraph_style: styles.block_style(kind).map(str::to_string),
       kind,
       quote_depth,
       list_depth,
@@ -688,6 +1079,10 @@ impl ParagraphBuilder {
 
   fn push_inline_code(&mut self, text: &str, style: RunStyle) {
     self.push_run(text, style);
+  }
+
+  fn push_run_node(&mut self, run: Run) {
+    self.runs.push(ParagraphChoice::WRun(Box::new(run)));
   }
 
   fn current_run_style(&self) -> RunStyle {
@@ -768,11 +1163,14 @@ impl ParagraphBuilder {
 
 #[derive(Debug, Default)]
 struct TableBuilder {
+  table_style: String,
+  alignments: Vec<Alignment>,
   rows: Vec<TableRowData>,
   current_row: Vec<TableCellData>,
   current_cell: Vec<Paragraph>,
   in_head: bool,
   current_head: bool,
+  current_cell_head: bool,
 }
 
 #[derive(Debug, Default)]
@@ -788,7 +1186,18 @@ struct TableCellData {
 }
 
 impl TableBuilder {
+  fn new(styles: &DocxStyles, alignments: Vec<Alignment>) -> Self {
+    Self {
+      table_style: styles.table.clone(),
+      alignments,
+      ..Default::default()
+    }
+  }
+
   fn start_row(&mut self) {
+    if !self.current_row.is_empty() || !self.current_cell.is_empty() {
+      self.end_row();
+    }
     self.current_row.clear();
     self.current_head = self.in_head;
   }
@@ -807,6 +1216,8 @@ impl TableBuilder {
 
   fn start_cell(&mut self) {
     self.current_cell.clear();
+    self.current_cell_head = self.in_head;
+    self.current_head |= self.current_cell_head;
   }
 
   fn end_cell(&mut self) {
@@ -815,7 +1226,7 @@ impl TableBuilder {
     }
     self.current_row.push(TableCellData {
       paragraphs: std::mem::take(&mut self.current_cell),
-      is_head: self.current_head,
+      is_head: self.current_cell_head,
     });
   }
 
@@ -831,18 +1242,35 @@ impl TableBuilder {
       .max()
       .unwrap_or(1)
       .max(1);
-    let cell_width = (8640 / column_count).max(720);
+    let table_width = 8220i64;
+    let cell_width = table_width / column_count as i64;
+    let alignments = self.alignments;
 
     Table {
       table_properties: Box::new(TableProperties {
         table_style: Some(TableStyle {
-          val: "TableGrid".to_string(),
+          val: self.table_style,
         }),
         table_width: Some(TableWidth {
-          width: Some(pct(5000)),
-          r#type: Some(TableWidthUnitValues::Pct),
+          width: Some(pct(table_width)),
+          r#type: Some(TableWidthUnitValues::Dxa),
+        }),
+        table_justification: Some(TableJustification {
+          val: TableRowAlignmentValues::Center,
         }),
         table_borders: Some(Box::new(table_borders())),
+        table_layout: Some(TableLayout {
+          r#type: Some(TableLayoutValues::Fixed),
+        }),
+        table_cell_margin_default: Some(Box::new(table_cell_margin_default())),
+        ..Default::default()
+      }),
+      table_grid: Box::new(TableGrid {
+        grid_column: (0..column_count)
+          .map(|_| GridColumn {
+            width: Some(dxa(cell_width)),
+          })
+          .collect(),
         ..Default::default()
       }),
       table_choice2: self
@@ -850,24 +1278,35 @@ impl TableBuilder {
         .into_iter()
         .map(|row| {
           TableChoice2::TableRow(Box::new(TableRow {
+            table_row_properties: Some(Box::new(table_row_properties(row.is_head))),
             table_row_choice: row
               .cells
               .into_iter()
-              .map(|cell| {
+              .enumerate()
+              .map(|(index, cell)| {
+                let is_head = cell.is_head || row.is_head;
                 TableRowChoice::TableCell(Box::new(TableCell {
                   table_cell_properties: Some(Box::new(TableCellProperties {
                     table_cell_width: Some(TableCellWidth {
-                      width: Some(pct(cell_width as i64)),
+                      width: Some(pct(cell_width)),
                       r#type: Some(TableWidthUnitValues::Dxa),
                     }),
-                    shading: (cell.is_head || row.is_head).then(table_shading),
+                    table_cell_borders: Some(Box::new(table_cell_borders())),
+                    shading: is_head.then(table_shading),
+                    table_cell_margin: Some(Box::new(table_cell_margin())),
+                    table_cell_vertical_alignment: Some(TableCellVerticalAlignment {
+                      val: TableVerticalAlignmentValues::Center,
+                    }),
                     ..Default::default()
                   })),
-                  table_cell_choice: cell
-                    .paragraphs
-                    .into_iter()
-                    .map(|paragraph| TableCellChoice::Paragraph(Box::new(paragraph)))
-                    .collect(),
+                  table_cell_choice: table_cell_paragraphs(
+                    cell.paragraphs,
+                    is_head,
+                    alignments.get(index).copied().unwrap_or(Alignment::None),
+                  )
+                  .into_iter()
+                  .map(|paragraph| TableCellChoice::Paragraph(Box::new(paragraph)))
+                  .collect(),
                   ..Default::default()
                 }))
               })
@@ -878,6 +1317,128 @@ impl TableBuilder {
         .collect(),
       ..Default::default()
     }
+  }
+}
+
+fn table_cell_paragraphs(
+  paragraphs: Vec<Paragraph>,
+  is_head: bool,
+  alignment: Alignment,
+) -> Vec<Paragraph> {
+  paragraphs
+    .into_iter()
+    .map(|mut paragraph| {
+      let properties = paragraph
+        .paragraph_properties
+        .get_or_insert_with(|| Box::new(ParagraphProperties::default()));
+      properties.justification = Some(Justification {
+        val: if is_head {
+          JustificationValues::Center
+        } else {
+          paragraph_alignment(alignment)
+        },
+      });
+      properties.spacing_between_lines = Some(SpacingBetweenLines {
+        before: Some(twips(0)),
+        after: Some(twips(0)),
+        line: Some(SignedTwipsMeasureValue::Twips(240)),
+        line_rule: Some(LineSpacingRuleValues::Auto),
+        ..Default::default()
+      });
+      if is_head {
+        make_paragraph_runs_bold(&mut paragraph);
+      }
+      paragraph
+    })
+    .collect()
+}
+
+fn paragraph_alignment(alignment: Alignment) -> JustificationValues {
+  match alignment {
+    Alignment::Center => JustificationValues::Center,
+    Alignment::Right => JustificationValues::Right,
+    Alignment::Left => JustificationValues::Left,
+    Alignment::None => JustificationValues::Center,
+  }
+}
+
+fn make_paragraph_runs_bold(paragraph: &mut Paragraph) {
+  for choice in &mut paragraph.paragraph_choice {
+    if let ParagraphChoice::WRun(run) = choice {
+      let properties = run
+        .run_properties
+        .get_or_insert_with(|| Box::new(RunProperties::default()));
+      properties
+        .run_properties_choice
+        .push(RunPropertiesChoice::Bold(Box::default()));
+      properties
+        .run_properties_choice
+        .push(RunPropertiesChoice::BoldComplexScript(Box::default()));
+    }
+  }
+}
+
+fn table_row_properties(is_head: bool) -> TableRowProperties {
+  let mut choices = vec![
+    TableRowPropertiesChoice::TableRowHeight(Box::new(TableRowHeight {
+      val: Some(twips(470)),
+      height_type: Some(HeightRuleValues::AtLeast),
+    })),
+    TableRowPropertiesChoice::TableJustification(Box::new(TableJustification {
+      val: TableRowAlignmentValues::Center,
+    })),
+  ];
+  if is_head {
+    choices.push(TableRowPropertiesChoice::TableHeader(Box::default()));
+  }
+
+  TableRowProperties {
+    table_row_properties_choice1: choices,
+    ..Default::default()
+  }
+}
+
+fn table_cell_margin_default() -> TableCellMarginDefault {
+  TableCellMarginDefault {
+    top_margin: Some(TopMargin {
+      width: Some(pct(0)),
+      r#type: Some(TableWidthUnitValues::Dxa),
+    }),
+    table_cell_left_margin: Some(TableCellLeftMargin {
+      width: Some(pct(108)),
+      r#type: Some(TableWidthUnitValues::Dxa),
+    }),
+    bottom_margin: Some(BottomMargin {
+      width: Some(pct(0)),
+      r#type: Some(TableWidthUnitValues::Dxa),
+    }),
+    table_cell_right_margin: Some(TableCellRightMargin {
+      width: Some(pct(108)),
+      r#type: Some(TableWidthUnitValues::Dxa),
+    }),
+    ..Default::default()
+  }
+}
+
+fn table_cell_margin() -> TableCellMargin {
+  TableCellMargin {
+    top_margin: Some(TopMargin {
+      width: Some(pct(0)),
+      r#type: Some(TableWidthUnitValues::Dxa),
+    }),
+    left_margin: Some(TableCellLeftMargin {
+      width: Some(pct(108)),
+      r#type: Some(TableWidthUnitValues::Dxa),
+    }),
+    bottom_margin: Some(BottomMargin {
+      width: Some(pct(0)),
+      r#type: Some(TableWidthUnitValues::Dxa),
+    }),
+    right_margin: Some(TableCellRightMargin {
+      width: Some(pct(108)),
+      r#type: Some(TableWidthUnitValues::Dxa),
+    }),
+    ..Default::default()
   }
 }
 
@@ -909,6 +1470,7 @@ fn push_code_block(
         line,
         &docx.highlighter.background,
         index == last,
+        &docx.styles,
       ));
     }
   } else {
@@ -917,13 +1479,19 @@ fn push_code_block(
         line,
         &docx.highlighter.background,
         index == last,
+        &docx.styles,
       )))
     }));
   }
   Ok(())
 }
 
-fn code_paragraph(line: Vec<CodeRun>, background: &str, last: bool) -> Paragraph {
+fn code_paragraph(
+  line: Vec<CodeRun>,
+  background: &str,
+  last: bool,
+  styles: &DocxStyles,
+) -> Paragraph {
   let runs = if line.is_empty() {
     vec![ParagraphChoice::WRun(Box::new(code_text_run(
       "",
@@ -936,7 +1504,7 @@ fn code_paragraph(line: Vec<CodeRun>, background: &str, last: bool) -> Paragraph
       .collect()
   };
 
-  let mut properties = block_properties(Some("NoSpacing"), ParagraphKind::Code, 0, None, None);
+  let mut properties = block_properties(Some(&styles.code), ParagraphKind::Code, 0, None, None);
   properties.shading = Some(fill_shading(background));
   properties.indentation = Some(Indentation {
     left: Some(signed_twips(200)),
@@ -998,6 +1566,7 @@ fn heading_paragraph_with_bookmark(
   level: usize,
   text: &str,
   bookmark: Option<BookmarkRef>,
+  styles: &DocxStyles,
 ) -> Paragraph {
   let mut paragraph_choice = Vec::new();
   if let Some(bookmark) = bookmark {
@@ -1028,17 +1597,14 @@ fn heading_paragraph_with_bookmark(
   }
 
   Paragraph {
-    paragraph_properties: Some(Box::new(paragraph_properties(&format!(
-      "Heading{}",
-      level.clamp(1, 9)
-    )))),
+    paragraph_properties: Some(Box::new(paragraph_properties(styles.heading(level)))),
     paragraph_choice,
     ..Default::default()
   }
 }
 
-fn cover_title_paragraph(text: &str) -> Paragraph {
-  let mut properties = paragraph_properties("Title");
+fn cover_title_paragraph(text: &str, styles: &DocxStyles) -> Paragraph {
+  let mut properties = paragraph_properties(&styles.title);
   properties.justification = Some(Justification {
     val: JustificationValues::Center,
   });
@@ -1070,9 +1636,9 @@ fn cover_title_paragraph(text: &str) -> Paragraph {
   }
 }
 
-fn toc_heading_paragraph(text: &str) -> Paragraph {
+fn toc_heading_paragraph(text: &str, styles: &DocxStyles) -> Paragraph {
   Paragraph {
-    paragraph_properties: Some(Box::new(paragraph_properties("TOCHeading"))),
+    paragraph_properties: Some(Box::new(paragraph_properties(&styles.toc_heading))),
     paragraph_choice: vec![ParagraphChoice::WRun(Box::new(text_run(
       text,
       RunStyle {
@@ -1100,13 +1666,120 @@ fn paragraph_properties(style: &str) -> ParagraphProperties {
   }
 }
 
+fn image_drawing(id: u32, image: &ImageRef) -> Drawing {
+  let (cx, cy) = image_extent(image.width, image.height);
+  Drawing {
+    drawing_choice: Some(DrawingChoice::Inline(Box::new(wp::Inline {
+      distance_from_top: Some(0),
+      distance_from_bottom: Some(0),
+      distance_from_left: Some(0),
+      distance_from_right: Some(0),
+      extent: Box::new(wp::Extent { cx, cy }),
+      effect_extent: Some(wp::EffectExtent {
+        left_edge: CoordinateValue::Emu(0),
+        top_edge: CoordinateValue::Emu(0),
+        right_edge: CoordinateValue::Emu(0),
+        bottom_edge: CoordinateValue::Emu(0),
+      }),
+      doc_properties: Box::new(wp::DocProperties {
+        id,
+        name: format!("Picture {id}"),
+        description: (!image.alt.is_empty()).then(|| image.alt.clone()),
+        ..Default::default()
+      }),
+      non_visual_graphic_frame_drawing_properties: Some(Box::new(
+        wp::NonVisualGraphicFrameDrawingProperties {
+          graphic_frame_locks: Some(Box::new(a::GraphicFrameLocks {
+            no_change_aspect: Some(BooleanValue::One),
+            ..Default::default()
+          })),
+          ..Default::default()
+        },
+      )),
+      graphic: Box::new(a::Graphic {
+        graphic_data: Box::new(a::GraphicData {
+          uri: "http://schemas.openxmlformats.org/drawingml/2006/picture".to_string(),
+          graphic_data_choice: vec![a::GraphicDataChoice::Picture(Box::new(pic::Picture {
+            non_visual_picture_properties: Box::new(pic::NonVisualPictureProperties {
+              non_visual_drawing_properties: Box::new(pic::NonVisualDrawingProperties {
+                id,
+                name: format!("Picture {id}"),
+                description: (!image.alt.is_empty()).then(|| image.alt.clone()),
+                ..Default::default()
+              }),
+              non_visual_picture_drawing_properties: Box::new(
+                pic::NonVisualPictureDrawingProperties {
+                  picture_locks: Some(Box::new(a::PictureLocks {
+                    no_change_aspect: Some(BooleanValue::One),
+                    ..Default::default()
+                  })),
+                  ..Default::default()
+                },
+              ),
+            }),
+            blip_fill: Box::new(pic::BlipFill {
+              blip: Some(Box::new(a::Blip {
+                embed: Some(image.relationship_id.clone()),
+                ..Default::default()
+              })),
+              blip_fill_choice: Some(pic::BlipFillChoice::Stretch(Box::new(a::Stretch {
+                fill_rectangle: Some(a::FillRectangle::default()),
+              }))),
+              ..Default::default()
+            }),
+            shape_properties: Box::new(pic::ShapeProperties {
+              transform2_d: Some(Box::new(a::Transform2D {
+                offset: Some(a::Offset {
+                  x: CoordinateValue::Emu(0),
+                  y: CoordinateValue::Emu(0),
+                }),
+                extents: Some(a::Extents {
+                  cx: CoordinateValue::Emu(cx),
+                  cy: CoordinateValue::Emu(cy),
+                }),
+                ..Default::default()
+              })),
+              shape_properties_choice1: Some(pic::ShapePropertiesChoice::PresetGeometry(Box::new(
+                a::PresetGeometry {
+                  preset: a::ShapeTypeValues::Rectangle,
+                  adjust_value_list: Some(a::AdjustValueList::default()),
+                  ..Default::default()
+                },
+              ))),
+              ..Default::default()
+            }),
+            ..Default::default()
+          }))],
+          ..Default::default()
+        }),
+        ..Default::default()
+      }),
+      ..Default::default()
+    }))),
+    ..Default::default()
+  }
+}
+
+fn image_extent(width: u32, height: u32) -> (i64, i64) {
+  const EMU_PER_PIXEL: f64 = 9525.0;
+  const MAX_WIDTH_EMU: f64 = 6_300_000.0;
+  let width_emu = width as f64 * EMU_PER_PIXEL;
+  let height_emu = height as f64 * EMU_PER_PIXEL;
+  let scale = if width_emu > MAX_WIDTH_EMU {
+    MAX_WIDTH_EMU / width_emu
+  } else {
+    1.0
+  };
+  ((width_emu * scale) as i64, (height_emu * scale) as i64)
+}
+
 fn toc_block(
   ctx: &RenderContext,
   cfg: &DocxConfig,
   docx: &mut DocxRenderContext<'_>,
 ) -> Vec<BodyChoice> {
   let mut out = vec![
-    BodyChoice::Paragraph(Box::new(toc_heading_paragraph("Contents"))),
+    BodyChoice::Paragraph(Box::new(toc_heading_paragraph("Contents", &docx.styles))),
     BodyChoice::Paragraph(Box::new(Paragraph {
       paragraph_choice: vec![
         ParagraphChoice::WRun(Box::new(field_char_run(FieldCharValues::Begin, true))),
@@ -1161,7 +1834,7 @@ fn toc_entry_paragraph(
   };
 
   Some(Paragraph {
-    paragraph_properties: Some(Box::new(toc_entry_properties(level))),
+    paragraph_properties: Some(Box::new(toc_entry_properties(level, &docx.styles))),
     paragraph_choice: vec![ParagraphChoice::Hyperlink(Box::new(Hyperlink {
       anchor: Some(bookmark),
       history: Some(OnOffValue::True),
@@ -1181,8 +1854,8 @@ fn toc_entry_paragraph(
   })
 }
 
-fn toc_entry_properties(level: usize) -> ParagraphProperties {
-  let mut properties = paragraph_properties(&format!("TOC{}", level.clamp(1, 9)));
+fn toc_entry_properties(level: usize, styles: &DocxStyles) -> ParagraphProperties {
+  let mut properties = paragraph_properties(styles.toc_entry(level));
   properties.indentation = Some(Indentation {
     left: Some(signed_twips(((level.saturating_sub(1)) * 420) as i64)),
     ..Default::default()
@@ -1278,6 +1951,89 @@ fn local_md_path(chapter: &Chapter, url: &str) -> Option<PathBuf> {
     .map_or_else(PathBuf::new, Path::to_path_buf);
   resolved.push(path);
   Some(normalize_path(&resolved))
+}
+
+fn local_asset_path(chapter: &Chapter, source_dir: &Path, url: &str) -> Option<PathBuf> {
+  if is_remote_url(url) {
+    return None;
+  }
+  let path = url.split(['#', '?']).next().unwrap_or(url);
+  if path.is_empty() {
+    return None;
+  }
+
+  let mut resolved = chapter
+    .source_path
+    .as_ref()
+    .and_then(|path| path.parent())
+    .map_or_else(PathBuf::new, Path::to_path_buf);
+  resolved.push(path);
+  Some(source_dir.join(normalize_path(&resolved)))
+}
+
+fn image_content_type(path: &Path, data: &[u8]) -> Option<&'static str> {
+  if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+    return Some("image/png");
+  }
+  if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+    return Some("image/jpeg");
+  }
+  match path.extension().and_then(|extension| extension.to_str()) {
+    Some(extension) if extension.eq_ignore_ascii_case("png") => Some("image/png"),
+    Some(extension) if extension.eq_ignore_ascii_case("jpg") => Some("image/jpeg"),
+    Some(extension) if extension.eq_ignore_ascii_case("jpeg") => Some("image/jpeg"),
+    _ => None,
+  }
+}
+
+fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+  png_dimensions(data).or_else(|| jpeg_dimensions(data))
+}
+
+fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+  if data.len() < 24 || !data.starts_with(b"\x89PNG\r\n\x1a\n") {
+    return None;
+  }
+  let width = u32::from_be_bytes(data[16..20].try_into().ok()?);
+  let height = u32::from_be_bytes(data[20..24].try_into().ok()?);
+  Some((width, height))
+}
+
+fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+  if data.len() < 4 || !data.starts_with(&[0xFF, 0xD8]) {
+    return None;
+  }
+  let mut index = 2usize;
+  while index + 9 < data.len() {
+    while index < data.len() && data[index] == 0xFF {
+      index += 1;
+    }
+    if index >= data.len() {
+      return None;
+    }
+    let marker = data[index];
+    index += 1;
+    if marker == 0xD9 || marker == 0xDA {
+      return None;
+    }
+    if index + 2 > data.len() {
+      return None;
+    }
+    let length = u16::from_be_bytes(data[index..index + 2].try_into().ok()?) as usize;
+    if length < 2 || index + length > data.len() {
+      return None;
+    }
+    if matches!(
+      marker,
+      0xC0 | 0xC1 | 0xC2 | 0xC3 | 0xC5 | 0xC6 | 0xC7 | 0xC9 | 0xCA | 0xCB | 0xCD | 0xCE | 0xCF
+    ) {
+      let height = u16::from_be_bytes(data[index + 3..index + 5].try_into().ok()?) as u32;
+      let width = u16::from_be_bytes(data[index + 5..index + 7].try_into().ok()?) as u32;
+      return Some((width, height));
+    }
+    index += length;
+  }
+  None
 }
 
 fn is_remote_url(url: &str) -> bool {
@@ -1433,15 +2189,6 @@ fn block_properties(
   properties
 }
 
-fn paragraph_style_for_kind(kind: ParagraphKind) -> Option<&'static str> {
-  match kind {
-    ParagraphKind::Code => Some("NoSpacing"),
-    ParagraphKind::List => Some("ListParagraph"),
-    ParagraphKind::Quote => Some("Quote"),
-    ParagraphKind::Normal => None,
-  }
-}
-
 fn text_run(text: &str, style: RunStyle) -> Run {
   Run {
     run_properties: run_properties(style).map(Box::new),
@@ -1512,44 +2259,74 @@ fn code_shading() -> Shading {
 }
 
 fn table_shading() -> Shading {
-  fill_shading("EDEFF3")
+  fill_shading("CCCCCC")
 }
 
 fn table_borders() -> TableBorders {
   TableBorders {
     top_border: Some(TopBorder {
       val: BorderValues::Single,
-      color: Some("D0D7DE".to_string()),
+      color: Some("auto".to_string()),
       size: Some(4),
       ..Default::default()
     }),
     left_border: Some(LeftBorder {
       val: BorderValues::Single,
-      color: Some("D0D7DE".to_string()),
+      color: Some("auto".to_string()),
       size: Some(4),
       ..Default::default()
     }),
     bottom_border: Some(BottomBorder {
       val: BorderValues::Single,
-      color: Some("D0D7DE".to_string()),
+      color: Some("auto".to_string()),
       size: Some(4),
       ..Default::default()
     }),
     right_border: Some(RightBorder {
       val: BorderValues::Single,
-      color: Some("D0D7DE".to_string()),
+      color: Some("auto".to_string()),
       size: Some(4),
       ..Default::default()
     }),
     inside_horizontal_border: Some(InsideHorizontalBorder {
       val: BorderValues::Single,
-      color: Some("D0D7DE".to_string()),
+      color: Some("auto".to_string()),
       size: Some(4),
       ..Default::default()
     }),
     inside_vertical_border: Some(InsideVerticalBorder {
       val: BorderValues::Single,
-      color: Some("D0D7DE".to_string()),
+      color: Some("auto".to_string()),
+      size: Some(4),
+      ..Default::default()
+    }),
+    ..Default::default()
+  }
+}
+
+fn table_cell_borders() -> TableCellBorders {
+  TableCellBorders {
+    top_border: Some(TopBorder {
+      val: BorderValues::Single,
+      color: Some("auto".to_string()),
+      size: Some(4),
+      ..Default::default()
+    }),
+    left_border: Some(LeftBorder {
+      val: BorderValues::Single,
+      color: Some("auto".to_string()),
+      size: Some(4),
+      ..Default::default()
+    }),
+    bottom_border: Some(BottomBorder {
+      val: BorderValues::Single,
+      color: Some("auto".to_string()),
+      size: Some(4),
+      ..Default::default()
+    }),
+    right_border: Some(RightBorder {
+      val: BorderValues::Single,
+      color: Some("auto".to_string()),
       size: Some(4),
       ..Default::default()
     }),
