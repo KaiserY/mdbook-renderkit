@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use mdbook_renderer::RenderContext;
@@ -31,7 +32,7 @@ use ooxmlsdk::schemas::schemas_openxmlformats_org_wordprocessingml_2006_main::{
   Text, TextType, Underline, UnderlineValues, UpdateFieldsOnOpen,
 };
 use ooxmlsdk::schemas::www_w3_org_xml_1998_namespace::SpaceProcessingModeValues;
-use ooxmlsdk::sdk::{SdkPart, WordprocessingDocumentType};
+use ooxmlsdk::sdk::SdkPart;
 use ooxmlsdk::simple_type::{
   BooleanValue, CoordinateValue, MeasurementOrPercentValue, OnOffValue, SignedTwipsMeasureValue,
   TwipsMeasureValue,
@@ -60,6 +61,7 @@ const RENDERKIT_LIST_STYLE: &str = "RenderkitList";
 const RENDERKIT_QUOTE_STYLE: &str = "RenderkitQuote";
 const RENDERKIT_TABLE_STYLE: &str = "RenderkitTable";
 const RENDERKIT_HYPERLINK_STYLE: &str = "RenderkitHyperlink";
+const DEFAULT_DOCX_TEMPLATE: &[u8] = include_bytes!("assets/template.docx");
 
 fn text_node(text: &str, preserve_space: bool) -> Text {
   Text(TextType {
@@ -218,27 +220,26 @@ fn write_docx(ctx: &RenderContext, path: &Path) -> Result<()> {
   if let Some(template) = &cfg.template {
     write_docx_from_template(ctx, &cfg, template, path)
   } else {
-    write_docx_from_scratch(ctx, &cfg, path)
+    write_docx_from_builtin_template(ctx, &cfg, path)
   }
 }
 
-fn write_docx_from_scratch(ctx: &RenderContext, cfg: &DocxConfig, path: &Path) -> Result<()> {
-  let mut package = WordprocessingDocument::create(WordprocessingDocumentType::Document);
-  let main_part = package.add_main_document_part()?;
-  let numbering_part = ensure_numbering_part(&mut package, &main_part)?;
-  let styles = DocxStyles::default();
-  write_docx_package(
-    ctx,
-    cfg,
-    path,
-    &mut package,
-    DocxPackageParts {
-      main_part: &main_part,
-      numbering_part: &numbering_part,
-      styles: &styles,
-      template: None,
-    },
-  )
+fn write_docx_from_builtin_template(
+  ctx: &RenderContext,
+  cfg: &DocxConfig,
+  path: &Path,
+) -> Result<()> {
+  eprintln!("renderkit: using built-in DOCX template");
+  let template_path = builtin_template_path();
+  fs::write(&template_path, DEFAULT_DOCX_TEMPLATE).with_context(|| {
+    format!(
+      "failed to write built-in DOCX template {}",
+      template_path.display()
+    )
+  })?;
+  let result = write_docx_from_template_path(ctx, cfg, &template_path, path);
+  let _ = fs::remove_file(&template_path);
+  result
 }
 
 fn write_docx_from_template(
@@ -249,8 +250,16 @@ fn write_docx_from_template(
 ) -> Result<()> {
   let template_path = ctx.root.join(template);
   eprintln!("renderkit: using DOCX template {}", template_path.display());
+  write_docx_from_template_path(ctx, cfg, &template_path, path)
+}
 
-  let mut package = WordprocessingDocument::create_from_template(&template_path)
+fn write_docx_from_template_path(
+  ctx: &RenderContext,
+  cfg: &DocxConfig,
+  template_path: &Path,
+  path: &Path,
+) -> Result<()> {
+  let mut package = WordprocessingDocument::create_from_template(template_path)
     .with_context(|| format!("failed to read DOCX template {}", template_path.display()))?;
   let main_part = package.main_document_part()?;
   let numbering_part = ensure_numbering_part(&mut package, &main_part)?;
@@ -268,6 +277,17 @@ fn write_docx_from_template(
       template: Some(template_profile),
     },
   )
+}
+
+fn builtin_template_path() -> PathBuf {
+  let nanos = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map(|duration| duration.as_nanos())
+    .unwrap_or_default();
+  std::env::temp_dir().join(format!(
+    "mdbook-renderkit-template-{}-{nanos}.docx",
+    std::process::id()
+  ))
 }
 
 fn write_docx_package(

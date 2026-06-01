@@ -23,3 +23,4 @@ target
 .codex
 
 tools/aikb-docx-template/target/
+tools/default-docx-template/target/
