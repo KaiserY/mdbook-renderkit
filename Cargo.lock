@@ -1635,17 +1635,22 @@ dependencies = [
 
 [[package]]
 name = "ooxmlsdk"
-version = "0.7.1"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6471f1203e4c5185b34cdbafaffd723368f9e8064d4e021a3ba5f2b61da690da"
 dependencies = [
  "ooxmlsdk-derive",
  "quick-xml 0.40.1",
+ "smallvec",
  "thiserror",
  "zip 8.6.0",
 ]
 
 [[package]]
 name = "ooxmlsdk-derive"
-version = "0.7.1"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a68f3e26721c07f3220bb266cf68690ae16ed64036ff1dc48b75d52dcb297f3"
 dependencies = [
  "proc-macro2",
  "quote",
