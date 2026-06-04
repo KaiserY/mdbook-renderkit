@@ -4,16 +4,16 @@ use std::path::PathBuf;
 
 use ooxmlsdk::parts::wordprocessing_document::WordprocessingDocument;
 use ooxmlsdk::schemas::schemas_openxmlformats_org_wordprocessingml_2006_main::{
-  BasedOn, BodyChoice, Bold, BoldComplexScript, BorderValues, BottomBorder, BottomMargin, Break,
-  BreakValues, Color, Document, FieldChar, FieldCharValues, FieldCode, FontSize,
-  FontSizeComplexScript, Indentation, InsideHorizontalBorder, InsideVerticalBorder, Justification,
-  JustificationValues, LeftBorder, NextParagraphStyle, Paragraph, ParagraphChoice,
-  ParagraphProperties, ParagraphStyleId, RightBorder, Run, RunChoice, RunFonts,
-  RunPropertiesBaseStyle, Shading, ShadingPatternValues, SpacingBetweenLines, Style as WordStyle,
-  StyleName, StyleParagraphProperties, StyleRunProperties, StyleTableProperties, StyleValues,
-  Styles, TableBorders, TableCellBorders, TableCellLeftMargin, TableCellMarginDefault,
-  TableCellRightMargin, TableCellVerticalAlignment, TableJustification, TableRowAlignmentValues,
-  TableStyleConditionalFormattingTableCellProperties,
+  BasedOn, BodyChoice, Bold, BoldComplexScript, BookmarkEnd, BookmarkStart, BorderValues,
+  BottomBorder, BottomMargin, Break, BreakValues, Color, Document, FieldChar, FieldCharValues,
+  FieldCode, FontSize, FontSizeComplexScript, Indentation, InsideHorizontalBorder,
+  InsideVerticalBorder, Justification, JustificationValues, LeftBorder, NextParagraphStyle,
+  Paragraph, ParagraphChoice, ParagraphProperties, ParagraphStyleId, RightBorder, Run, RunChoice,
+  RunFonts, RunPropertiesBaseStyle, Shading, ShadingPatternValues, SpacingBetweenLines,
+  Style as WordStyle, StyleName, StyleParagraphProperties, StyleRunProperties,
+  StyleTableProperties, StyleValues, Styles, TableBorders, TableCellBorders, TableCellLeftMargin,
+  TableCellMarginDefault, TableCellRightMargin, TableCellVerticalAlignment, TableJustification,
+  TableRowAlignmentValues, TableStyleConditionalFormattingTableCellProperties,
   TableStyleConditionalFormattingTableProperties, TableStyleOverrideValues, TableStyleProperties,
   TableVerticalAlignmentValues, TableWidthUnitValues, Text, TextType, TopBorder, TopMargin,
   Underline, UnderlineValues,
@@ -26,10 +26,10 @@ use ooxmlsdk::simple_type::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const CONTENT_MARKER: &str = "MDBOOK_RENDERKIT_CONTENT";
-const TITLE_MARKER: &str = "MDBOOK_RENDERKIT_TITLE";
-const AUTHOR_MARKER: &str = "MDBOOK_RENDERKIT_AUTHOR";
-const MARKERS: [&str; 3] = [CONTENT_MARKER, TITLE_MARKER, AUTHOR_MARKER];
+const TITLE_MARKER: &str = "mdbook_renderkit_title";
+const AUTHOR_MARKER: &str = "mdbook_renderkit_author";
+const CONTENT_BOOKMARK_MARKER: &str = "mdbook_renderkit_content";
+const MARKERS: [&str; 3] = [CONTENT_BOOKMARK_MARKER, TITLE_MARKER, AUTHOR_MARKER];
 const DEFAULT_INPUT: &str = "../aikb-books/single-node-install/template_old.docx";
 const DEFAULT_OUTPUT: &str = "../aikb-books/single-node-install/template.docx";
 
@@ -690,8 +690,9 @@ fn rewrite_document(document: &mut Document) -> Result<()> {
   apply_cover_markers(&mut new_choices)?;
   new_choices.push(choices[section_break].clone());
   new_choices.extend(toc_block());
-  new_choices.push(BodyChoice::Paragraph(Box::new(marker_paragraph(
-    CONTENT_MARKER,
+  new_choices.push(BodyChoice::Paragraph(Box::new(bookmark_marker_paragraph(
+    CONTENT_BOOKMARK_MARKER,
+    "900003",
   ))));
   new_choices.push(BodyChoice::Paragraph(Box::new(page_break_paragraph())));
   new_choices.push(BodyChoice::Paragraph(Box::new(back_cover)));
@@ -742,44 +743,95 @@ fn last_drawing_paragraph(choices: &[BodyChoice]) -> Result<Paragraph> {
     .ok_or_else(|| "legacy template has no drawing paragraph for the back cover".into())
 }
 
-fn apply_cover_markers(choices: &mut [BodyChoice]) -> Result<()> {
-  let mut text_paragraphs = choices
-    .iter_mut()
-    .filter_map(|choice| {
+fn apply_cover_markers(choices: &mut Vec<BodyChoice>) -> Result<()> {
+  for choice in choices.iter_mut() {
+    let BodyChoice::Paragraph(paragraph) = choice else {
+      continue;
+    };
+    clear_paragraph_keep_constraints(paragraph);
+  }
+
+  let text_indices = choices
+    .iter()
+    .enumerate()
+    .filter_map(|(index, choice)| {
       let BodyChoice::Paragraph(paragraph) = choice else {
         return None;
       };
-      (!paragraph_text(paragraph).trim().is_empty()).then_some(paragraph.as_mut())
+      (!paragraph_text(paragraph).trim().is_empty()).then_some(index)
     })
     .collect::<Vec<_>>();
 
-  if text_paragraphs.len() < 3 {
+  if text_indices.len() < 3 {
     return Err("cover has fewer than three text paragraphs".into());
   }
 
-  replace_paragraph_text(text_paragraphs[0], TITLE_MARKER)?;
-  replace_paragraph_text(text_paragraphs[1], "")?;
-  let author_index = text_paragraphs.len().saturating_sub(2);
-  replace_paragraph_text(text_paragraphs[author_index], AUTHOR_MARKER)?;
-  for (index, paragraph) in text_paragraphs.iter_mut().enumerate() {
-    if index != 0 && index != author_index {
-      replace_paragraph_text(paragraph, "")?;
+  let title_index = text_indices[0];
+  let subtitle_index = text_indices[1];
+  let author_text_index = text_indices.len().saturating_sub(2);
+  let author_index = text_indices[author_text_index];
+
+  add_bookmark_marker(paragraph_mut_at(choices, title_index)?, TITLE_MARKER, "900001");
+  add_bookmark_marker(
+    paragraph_mut_at(choices, author_index)?,
+    AUTHOR_MARKER,
+    "900002",
+  );
+
+  for (text_index, body_index) in text_indices.iter().copied().enumerate() {
+    if text_index != 0 && text_index != author_text_index {
+      replace_paragraph_text(paragraph_mut_at(choices, body_index)?, "")?;
     }
   }
+  choices.remove(subtitle_index);
   Ok(())
 }
 
-fn marker_paragraph(marker: &str) -> Paragraph {
+fn paragraph_mut_at(choices: &mut [BodyChoice], index: usize) -> Result<&mut Paragraph> {
+  match choices.get_mut(index) {
+    Some(BodyChoice::Paragraph(paragraph)) => Ok(paragraph.as_mut()),
+    _ => Err("cover text index no longer points to a paragraph".into()),
+  }
+}
+
+fn clear_paragraph_keep_constraints(paragraph: &mut Paragraph) {
+  if let Some(properties) = paragraph.paragraph_properties.as_mut() {
+    properties.keep_next = None;
+    properties.keep_lines = None;
+  }
+}
+
+fn bookmark_marker_paragraph(name: &str, id: &str) -> Paragraph {
   Paragraph {
-    paragraph_choice: vec![ParagraphChoice::WRun(Box::new(Run {
-      run_choice: vec![RunChoice::Text(Box::new(Text(TextType {
-        xml_content: Some(marker.to_string()),
+    paragraph_choice: vec![
+      ParagraphChoice::BookmarkStart(Box::new(BookmarkStart {
+        name: name.to_string(),
+        id: id.to_string(),
         ..Default::default()
-      })))],
-      ..Default::default()
-    }))],
+      })),
+      ParagraphChoice::BookmarkEnd(Box::new(BookmarkEnd {
+        id: id.to_string(),
+        ..Default::default()
+      })),
+    ],
     ..Default::default()
   }
+}
+
+fn add_bookmark_marker(paragraph: &mut Paragraph, name: &str, id: &str) {
+  paragraph
+    .paragraph_choice
+    .insert(0, ParagraphChoice::BookmarkStart(Box::new(BookmarkStart {
+      name: name.to_string(),
+      id: id.to_string(),
+      ..Default::default()
+    })));
+  paragraph
+    .paragraph_choice
+    .push(ParagraphChoice::BookmarkEnd(Box::new(BookmarkEnd {
+      id: id.to_string(),
+      ..Default::default()
+    })));
 }
 
 fn toc_block() -> Vec<BodyChoice> {
@@ -904,13 +956,16 @@ fn replace_paragraph_text(paragraph: &mut Paragraph, replacement: &str) -> Resul
 
 fn validate_markers(document: &Document) -> Result<()> {
   let mut counts = [0usize; MARKERS.len()];
+  for name in document_bookmark_names(document) {
+    if let Some(index) = MARKERS.iter().position(|marker| marker == &name) {
+      counts[index] += 1;
+    }
+  }
   for text in document_text_nodes(document) {
     let Some(content) = text.0.xml_content.as_deref() else {
       continue;
     };
-    if let Some(index) = MARKERS.iter().position(|marker| marker == &content) {
-      counts[index] += 1;
-    } else if content.contains("MDBOOK_RENDERKIT_") {
+    if content.contains("MDBOOK_RENDERKIT_") {
       return Err(format!("marker is not an exact text run: {content}").into());
     }
   }
@@ -922,6 +977,23 @@ fn validate_markers(document: &Document) -> Result<()> {
     }
   }
   Ok(())
+}
+
+fn document_bookmark_names(document: &Document) -> Vec<&str> {
+  let mut out = Vec::new();
+  if let Some(body) = document.body.as_ref() {
+    for choice in &body.body_choice {
+      let BodyChoice::Paragraph(paragraph) = choice else {
+        continue;
+      };
+      for paragraph_choice in &paragraph.paragraph_choice {
+        if let ParagraphChoice::BookmarkStart(bookmark) = paragraph_choice {
+          out.push(bookmark.name.as_str());
+        }
+      }
+    }
+  }
+  out
 }
 
 fn document_text_nodes(document: &Document) -> Vec<&Text> {

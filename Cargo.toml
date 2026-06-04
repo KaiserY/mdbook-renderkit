@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-ooxmlsdk = "0.8.0"
+ooxmlsdk = { path = "../ooxmlsdk/crates/ooxmlsdk" }
 typst = "0.14.2"
 typst-pdf = "0.14.2"
 typst-kit = { version = "0.14.2", default-features = false, features = [

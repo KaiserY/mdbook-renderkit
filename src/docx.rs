@@ -6,9 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use mdbook_renderer::RenderContext;
 use mdbook_renderer::book::Chapter;
-use ooxmlsdk::common::{XmlNamespace as XmlNamespaceDecl, XmlNamespaceUri, XmlPrefix};
+use ooxmlsdk::common::XmlNamespace as XmlNamespaceDecl;
 use ooxmlsdk::namespaces::XmlKnownNamespace;
 use ooxmlsdk::parts::document_settings_part::DocumentSettingsPart;
+use ooxmlsdk::parts::image_part::ImagePart;
 use ooxmlsdk::parts::main_document_part::MainDocumentPart;
 use ooxmlsdk::parts::numbering_definitions_part::NumberingDefinitionsPart;
 use ooxmlsdk::parts::wordprocessing_document::WordprocessingDocument;
@@ -47,10 +48,13 @@ const TASK_DONE_NUM_ID: i32 = 3;
 const TASK_TODO_NUM_ID: i32 = 4;
 const FIRST_ORDERED_NUM_ID: i32 = 10;
 const DEFAULT_CONTENT_WIDTH_TWIPS: i64 = 8220;
-const TEMPLATE_CONTENT_MARKER: &str = "MDBOOK_RENDERKIT_CONTENT";
-const TEMPLATE_TITLE_MARKER: &str = "MDBOOK_RENDERKIT_TITLE";
-const TEMPLATE_AUTHOR_MARKER: &str = "MDBOOK_RENDERKIT_AUTHOR";
-const TEMPLATE_MARKER_PREFIX: &str = "MDBOOK_RENDERKIT_";
+const TEMPLATE_CONTENT_BOOKMARK: &str = "mdbook_renderkit_content";
+const TEMPLATE_TITLE_BOOKMARK: &str = "mdbook_renderkit_title";
+const TEMPLATE_AUTHOR_BOOKMARK: &str = "mdbook_renderkit_author";
+const LEGACY_TEMPLATE_CONTENT_MARKER: &str = "MDBOOK_RENDERKIT_CONTENT";
+const LEGACY_TEMPLATE_TITLE_MARKER: &str = "MDBOOK_RENDERKIT_TITLE";
+const LEGACY_TEMPLATE_AUTHOR_MARKER: &str = "MDBOOK_RENDERKIT_AUTHOR";
+const LEGACY_TEMPLATE_MARKER_PREFIX: &str = "MDBOOK_RENDERKIT_";
 const RENDERKIT_TITLE_STYLE: &str = "RenderkitTitle";
 const RENDERKIT_BODY_STYLE: &str = "RenderkitBody";
 const RENDERKIT_TOC_HEADING_STYLE: &str = "RenderkitTocHeading";
@@ -149,6 +153,7 @@ struct TemplateProfile {
   content_index: usize,
   toc_index: Option<usize>,
   body_section_properties: Option<Box<SectionProperties>>,
+  next_bookmark_id: usize,
 }
 
 impl Default for DocxStyles {
@@ -324,7 +329,18 @@ fn render_document(
   styles: &DocxStyles,
   template: Option<TemplateProfile>,
 ) -> Result<(Document, Vec<OrderedListDefinition>)> {
-  let mut docx = DocxRenderContext::new(ctx, package, main_part, cfg, styles.clone());
+  let next_bookmark_id = template
+    .as_ref()
+    .map(|template| template.next_bookmark_id)
+    .unwrap_or(1);
+  let mut docx = DocxRenderContext::new(
+    ctx,
+    package,
+    main_part,
+    cfg,
+    styles.clone(),
+    next_bookmark_id,
+  );
   let document = document(ctx, cfg, &mut docx, template)?;
   Ok((document, docx.ordered_lists))
 }
@@ -457,10 +473,10 @@ fn template_profile(
       .cloned()
   });
 
-  let body_section_properties = paragraph_section_properties
+  let layout_section_properties = paragraph_section_properties
     .clone()
-    .or(body_section_properties);
-  if let Some(content_width) = section_content_width_twips(body_section_properties.as_deref()) {
+    .or_else(|| body_section_properties.clone());
+  if let Some(content_width) = section_content_width_twips(layout_section_properties.as_deref()) {
     styles.content_width_twips = content_width;
     styles.image_max_width_emu = twips_to_emu(content_width);
   }
@@ -468,6 +484,7 @@ fn template_profile(
   let mut body_choices = body.body_choice.clone();
   let toc_index = toc_field_index(&body_choices);
   let content_index = apply_template_markers(ctx, &mut body_choices)?;
+  let next_bookmark_id = next_bookmark_id(&body_choices);
   Ok((
     styles,
     TemplateProfile {
@@ -475,8 +492,30 @@ fn template_profile(
       content_index,
       toc_index,
       body_section_properties,
+      next_bookmark_id,
     },
   ))
+}
+
+fn next_bookmark_id(body_choices: &[BodyChoice]) -> usize {
+  body_choices
+    .iter()
+    .filter_map(|choice| {
+      let BodyChoice::Paragraph(paragraph) = choice else {
+        return None;
+      };
+      Some(paragraph)
+    })
+    .flat_map(|paragraph| &paragraph.paragraph_choice)
+    .filter_map(|choice| {
+      let ParagraphChoice::BookmarkStart(bookmark) = choice else {
+        return None;
+      };
+      bookmark.id.parse::<usize>().ok()
+    })
+    .max()
+    .unwrap_or(0)
+    + 1
 }
 
 fn toc_field_index(body_choices: &[BodyChoice]) -> Option<usize> {
@@ -504,7 +543,7 @@ fn paragraph_has_toc_field(paragraph: &Paragraph) -> bool {
 }
 
 fn wordprocessing_xmlns() -> Vec<XmlNamespaceDecl> {
-  vec![known_xmlns(XmlKnownNamespace::W)]
+  Vec::new()
 }
 
 fn section_content_width_twips(section_properties: Option<&SectionProperties>) -> Option<i64> {
@@ -535,6 +574,27 @@ fn apply_template_markers(ctx: &RenderContext, body_choices: &mut [BodyChoice]) 
     let BodyChoice::Paragraph(paragraph) = choice else {
       continue;
     };
+    if paragraph_has_bookmark(paragraph, TEMPLATE_CONTENT_BOOKMARK)
+      && content_index.replace(body_index).is_some()
+    {
+      bail!("DOCX template marker {TEMPLATE_CONTENT_BOOKMARK} appears more than once");
+    }
+    if paragraph_has_bookmark(paragraph, TEMPLATE_TITLE_BOOKMARK) {
+      title_count += 1;
+      if title_count > 1 {
+        bail!("DOCX template marker {TEMPLATE_TITLE_BOOKMARK} appears more than once");
+      }
+      remove_bookmark_marker(paragraph, TEMPLATE_TITLE_BOOKMARK);
+      replace_paragraph_text(paragraph, title)?;
+    }
+    if paragraph_has_bookmark(paragraph, TEMPLATE_AUTHOR_BOOKMARK) {
+      author_count += 1;
+      if author_count > 1 {
+        bail!("DOCX template marker {TEMPLATE_AUTHOR_BOOKMARK} appears more than once");
+      }
+      remove_bookmark_marker(paragraph, TEMPLATE_AUTHOR_BOOKMARK);
+      replace_paragraph_text(paragraph, &author)?;
+    }
     for paragraph_choice in &mut paragraph.paragraph_choice {
       let ParagraphChoice::WRun(run) = paragraph_choice else {
         continue;
@@ -547,29 +607,29 @@ fn apply_template_markers(ctx: &RenderContext, body_choices: &mut [BodyChoice]) 
           continue;
         };
         match content {
-          TEMPLATE_CONTENT_MARKER if content_index.replace(body_index).is_some() => {
-            bail!("DOCX template marker {TEMPLATE_CONTENT_MARKER} appears more than once");
+          LEGACY_TEMPLATE_CONTENT_MARKER if content_index.replace(body_index).is_some() => {
+            bail!("DOCX template marker {LEGACY_TEMPLATE_CONTENT_MARKER} appears more than once");
           }
-          TEMPLATE_CONTENT_MARKER => {}
-          TEMPLATE_TITLE_MARKER => {
+          LEGACY_TEMPLATE_CONTENT_MARKER => {}
+          LEGACY_TEMPLATE_TITLE_MARKER => {
             title_count += 1;
             if title_count > 1 {
-              bail!("DOCX template marker {TEMPLATE_TITLE_MARKER} appears more than once");
+              bail!("DOCX template marker {LEGACY_TEMPLATE_TITLE_MARKER} appears more than once");
             }
             text.0.xml_content = Some(title.to_string());
             text.0.space =
               text_needs_preserve(title).then_some(SpaceProcessingModeValues::Preserve);
           }
-          TEMPLATE_AUTHOR_MARKER => {
+          LEGACY_TEMPLATE_AUTHOR_MARKER => {
             author_count += 1;
             if author_count > 1 {
-              bail!("DOCX template marker {TEMPLATE_AUTHOR_MARKER} appears more than once");
+              bail!("DOCX template marker {LEGACY_TEMPLATE_AUTHOR_MARKER} appears more than once");
             }
             text.0.xml_content = Some(author.clone());
             text.0.space =
               text_needs_preserve(&author).then_some(SpaceProcessingModeValues::Preserve);
           }
-          other if other.contains(TEMPLATE_MARKER_PREFIX) => {
+          other if other.contains(LEGACY_TEMPLATE_MARKER_PREFIX) => {
             bail!("DOCX template marker must be a complete text run without extra text: {other}");
           }
           _ => {}
@@ -579,16 +639,76 @@ fn apply_template_markers(ctx: &RenderContext, body_choices: &mut [BodyChoice]) 
   }
 
   let Some(content_index) = content_index else {
-    bail!("DOCX template missing required marker {TEMPLATE_CONTENT_MARKER}");
+    bail!(
+      "DOCX template missing required marker {TEMPLATE_CONTENT_BOOKMARK} or {LEGACY_TEMPLATE_CONTENT_MARKER}"
+    );
   };
   if title_count == 0 {
-    bail!("DOCX template missing required marker {TEMPLATE_TITLE_MARKER}");
+    bail!(
+      "DOCX template missing required marker {TEMPLATE_TITLE_BOOKMARK} or {LEGACY_TEMPLATE_TITLE_MARKER}"
+    );
   }
   if author_count == 0 {
-    bail!("DOCX template missing required marker {TEMPLATE_AUTHOR_MARKER}");
+    bail!(
+      "DOCX template missing required marker {TEMPLATE_AUTHOR_BOOKMARK} or {LEGACY_TEMPLATE_AUTHOR_MARKER}"
+    );
   }
 
   Ok(content_index)
+}
+
+fn paragraph_has_bookmark(paragraph: &Paragraph, name: &str) -> bool {
+  paragraph.paragraph_choice.iter().any(|choice| {
+    matches!(
+      choice,
+      ParagraphChoice::BookmarkStart(bookmark) if bookmark.name == name
+    )
+  })
+}
+
+fn remove_bookmark_marker(paragraph: &mut Paragraph, name: &str) {
+  let ids = paragraph
+    .paragraph_choice
+    .iter()
+    .filter_map(|choice| {
+      let ParagraphChoice::BookmarkStart(bookmark) = choice else {
+        return None;
+      };
+      (bookmark.name == name).then_some(bookmark.id.clone())
+    })
+    .collect::<Vec<_>>();
+
+  paragraph.paragraph_choice.retain(|choice| match choice {
+    ParagraphChoice::BookmarkStart(bookmark) => bookmark.name != name,
+    ParagraphChoice::BookmarkEnd(bookmark) => !ids.iter().any(|id| id == &bookmark.id),
+    _ => true,
+  });
+}
+
+fn replace_paragraph_text(paragraph: &mut Paragraph, replacement: &str) -> Result<()> {
+  let mut replaced = false;
+  for choice in &mut paragraph.paragraph_choice {
+    let ParagraphChoice::WRun(run) = choice else {
+      continue;
+    };
+    for run_choice in &mut run.run_choice {
+      let RunChoice::Text(text) = run_choice else {
+        continue;
+      };
+      if replaced {
+        text.0.xml_content = None;
+      } else {
+        text.0.xml_content = Some(replacement.to_string());
+        text.0.space =
+          text_needs_preserve(replacement).then_some(SpaceProcessingModeValues::Preserve);
+        replaced = true;
+      }
+    }
+  }
+  if !replaced {
+    bail!("DOCX template marker paragraph has no text run to replace");
+  }
+  Ok(())
 }
 
 fn load_config(ctx: &RenderContext) -> Result<DocxConfig> {
@@ -801,7 +921,6 @@ fn toc_field_code_run(instruction: &str) -> Run {
 
 fn document_xmlns() -> Vec<XmlNamespaceDecl> {
   vec![
-    known_xmlns(XmlKnownNamespace::W),
     known_xmlns(XmlKnownNamespace::R),
     known_xmlns(XmlKnownNamespace::Wp),
     known_xmlns(XmlKnownNamespace::A),
@@ -813,10 +932,7 @@ fn document_xmlns() -> Vec<XmlNamespaceDecl> {
 }
 
 fn known_xmlns(namespace: XmlKnownNamespace) -> XmlNamespaceDecl {
-  XmlNamespaceDecl {
-    prefix: XmlPrefix::new(namespace.prefix_bytes()),
-    uri: XmlNamespaceUri::Known(namespace),
-  }
+  XmlNamespaceDecl::Known(namespace)
 }
 
 fn chapter_level(chapter: &Chapter) -> usize {
@@ -1064,6 +1180,7 @@ impl<'a> DocxRenderContext<'a> {
     main_part: &'a MainDocumentPart,
     cfg: &DocxConfig,
     styles: DocxStyles,
+    next_bookmark_id: usize,
   ) -> Self {
     Self {
       source_dir: ctx.source_dir(),
@@ -1076,7 +1193,7 @@ impl<'a> DocxRenderContext<'a> {
       images: HashMap::new(),
       bookmarks: HashMap::new(),
       bookmark_ids: HashMap::new(),
-      next_bookmark_id: 1,
+      next_bookmark_id,
       next_drawing_id: 1,
       next_numbering_id: FIRST_ORDERED_NUM_ID,
     }
@@ -1137,7 +1254,15 @@ impl<'a> DocxRenderContext<'a> {
       let Some(content_type) = image_content_type(&image_path, &data) else {
         return Ok(None);
       };
-      let part = self.main_part.add_image_part(self.package, content_type)?;
+      let part_path = image_part_path(&self.source_dir, &image_path);
+      let part = self
+        .main_part
+        .add_new_part_with_content_type_and_path::<_, ImagePart>(
+          self.package,
+          self.main_part.next_relationship_id(self.package)?,
+          content_type,
+          part_path,
+        )?;
       part.set_data(self.package, data)?;
       let relationship_id = part
         .relationship_id()
@@ -1916,7 +2041,7 @@ fn image_drawing(id: u32, image: &ImageRef) -> Drawing {
                 },
               ),
             })),
-            blip_fill: Box::new(pic::BlipFill {
+            blip_fill: Some(Box::new(pic::BlipFill {
               blip: Some(Box::new(a::Blip {
                 embed: Some(image.relationship_id.clone()),
                 ..Default::default()
@@ -1925,7 +2050,7 @@ fn image_drawing(id: u32, image: &ImageRef) -> Drawing {
                 fill_rectangle: Some(a::FillRectangle::default()),
               }))),
               ..Default::default()
-            }),
+            })),
             shape_properties: Some(Box::new(pic::ShapeProperties {
               transform2_d: Some(Box::new(a::Transform2D {
                 offset: Some(a::Offset {
@@ -2066,6 +2191,48 @@ fn image_content_type(path: &Path, data: &[u8]) -> Option<&'static str> {
     Some(extension) if extension.eq_ignore_ascii_case("jpg") => Some("image/jpeg"),
     Some(extension) if extension.eq_ignore_ascii_case("jpeg") => Some("image/jpeg"),
     _ => None,
+  }
+}
+
+fn image_part_path(source_dir: &Path, image_path: &Path) -> String {
+  let relative_path = image_path.strip_prefix(source_dir).unwrap_or(image_path);
+  let mut name = String::new();
+  for component in relative_path.components() {
+    let std::path::Component::Normal(component) = component else {
+      continue;
+    };
+    if !name.is_empty() {
+      name.push('_');
+    }
+    name.push_str(&safe_part_path_component(
+      component.to_string_lossy().as_ref(),
+    ));
+  }
+
+  if name.is_empty() {
+    name.push_str("image");
+  }
+
+  format!("word/media/{name}")
+}
+
+fn safe_part_path_component(component: &str) -> String {
+  let mut out = String::with_capacity(component.len());
+  let mut previous_was_separator = false;
+  for ch in component.chars() {
+    if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' {
+      out.push(ch);
+      previous_was_separator = false;
+    } else if !previous_was_separator {
+      out.push('_');
+      previous_was_separator = true;
+    }
+  }
+  let out = out.trim_matches('_');
+  if out.is_empty() {
+    "_".to_string()
+  } else {
+    out.to_string()
   }
 }
 
