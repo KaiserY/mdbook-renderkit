@@ -87,10 +87,6 @@ fn pct(value: i64) -> MeasurementOrPercentValue {
     .expect("static measurement value is valid")
 }
 
-fn twips(value: u64) -> TwipsMeasureValue {
-  TwipsMeasureValue::Twips(value)
-}
-
 fn dxa(value: i64) -> TwipsMeasureValue {
   TwipsMeasureValue::Twips(value.max(0) as u64)
 }
@@ -543,7 +539,7 @@ fn paragraph_has_toc_field(paragraph: &Paragraph) -> bool {
 }
 
 fn wordprocessing_xmlns() -> Vec<XmlNamespaceDecl> {
-  Vec::new()
+  vec![known_xmlns(XmlKnownNamespace::W)]
 }
 
 fn section_content_width_twips(section_properties: Option<&SectionProperties>) -> Option<i64> {
@@ -921,6 +917,7 @@ fn toc_field_code_run(instruction: &str) -> Run {
 
 fn document_xmlns() -> Vec<XmlNamespaceDecl> {
   vec![
+    known_xmlns(XmlKnownNamespace::W),
     known_xmlns(XmlKnownNamespace::R),
     known_xmlns(XmlKnownNamespace::Wp),
     known_xmlns(XmlKnownNamespace::A),
@@ -1711,7 +1708,7 @@ impl TableBuilder {
     let alignments = self.alignments;
 
     Table {
-      table_properties: Box::new(TableProperties {
+      table_properties: Some(Box::new(TableProperties {
         table_style: self.table_style.map(|val| TableStyle { val }),
         table_width: Some(TableWidth {
           width: Some(pct(table_width)),
@@ -1727,7 +1724,7 @@ impl TableBuilder {
           ..Default::default()
         }),
         ..Default::default()
-      }),
+      })),
       table_grid: Some(Box::new(TableGrid {
         grid_column: (0..column_count)
           .map(|_| GridColumn {
@@ -1900,7 +1897,7 @@ fn code_run_properties(style: CodeRunStyle) -> RunProperties {
   }
   if let Some(color) = style.color {
     choices.push(RunPropertiesChoice::Color(Box::new(Color {
-      val: color,
+      val: Some(color),
       ..Default::default()
     })));
   }
@@ -2048,6 +2045,7 @@ fn image_drawing(id: u32, image: &ImageRef) -> Drawing {
               })),
               blip_fill_choice: Some(pic::BlipFillChoice::Stretch(Box::new(a::Stretch {
                 fill_rectangle: Some(a::FillRectangle::default()),
+                ..Default::default()
               }))),
               ..Default::default()
             })),
@@ -2369,7 +2367,7 @@ fn numbering_level(level: i32, format: NumberFormatValues, text: &str) -> Level 
             ooxmlsdk::schemas::schemas_openxmlformats_org_wordprocessingml_2006_main::PreviousParagraphProperties {
                 indentation: Some(Indentation {
                     left: Some(signed_twips(((level as usize + 1) * 420) as i64)),
-                    hanging: Some(twips(240)),
+                    hanging: Some(signed_twips(240)),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -2510,5 +2508,38 @@ fn heading_level(level: HeadingLevel) -> usize {
     HeadingLevel::H4 => 4,
     HeadingLevel::H5 => 5,
     HeadingLevel::H6 => 6,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn document_root_declares_wordprocessing_namespace() {
+    let xml = Document {
+      xmlns: document_xmlns(),
+      body: Some(Box::default()),
+      ..Default::default()
+    }
+    .to_xml()
+    .expect("document XML should serialize");
+
+    assert!(xml.starts_with("<w:document "));
+    assert!(
+      xml.contains(r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#)
+    );
+  }
+
+  #[test]
+  fn numbering_root_declares_wordprocessing_namespace() {
+    let xml = numbering_definitions(&[])
+      .to_xml()
+      .expect("numbering XML should serialize");
+
+    assert!(xml.starts_with("<w:numbering "));
+    assert!(
+      xml.contains(r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#)
+    );
   }
 }
