@@ -1,5 +1,6 @@
 mod docx;
 mod epub;
+mod heading_number;
 mod pdf;
 
 use std::io;

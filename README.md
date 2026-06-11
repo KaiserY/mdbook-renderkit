@@ -14,11 +14,15 @@ command = "mdbook-renderkit render-pdf"
 # admonish = false
 # Optional, use mdBook's chapter numbers for PDF bookmark titles and levels.
 # section-number = false
+# Optional, do not force a page break after every chapter.
+# chapter-no-pagebreak = false
 
 [output.docx]
 command = "mdbook-renderkit render-docx"
 # Optional, use mdBook's chapter numbers for DOCX heading levels.
 # section-number = false
+# Optional, do not force a page break between chapters.
+# chapter-no-pagebreak = false
 # Optional, insert a Word TOC field after the title.
 # toc = true
 # Optional, TOC heading depth.

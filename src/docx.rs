@@ -43,6 +43,8 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Color as SyntectColor, FontStyle as SyntectFontStyle, Style, Theme};
 use syntect::parsing::SyntaxSet;
 
+use crate::heading_number::{HeadingNumberer, chapter_level, chapter_number_text};
+
 const BULLET_NUM_ID: i32 = 1;
 const TASK_DONE_NUM_ID: i32 = 3;
 const TASK_TODO_NUM_ID: i32 = 4;
@@ -104,6 +106,7 @@ fn twips_to_emu(value: i64) -> i64 {
 struct DocxConfig {
   template: Option<PathBuf>,
   section_number: bool,
+  chapter_no_pagebreak: bool,
   code_highlight: bool,
   code_theme: String,
 }
@@ -113,6 +116,7 @@ impl Default for DocxConfig {
     Self {
       template: None,
       section_number: false,
+      chapter_no_pagebreak: false,
       code_highlight: true,
       code_theme: "InspiredGitHub".to_string(),
     }
@@ -796,13 +800,13 @@ fn generated_content_choices(
       out.push(BodyChoice::Paragraph(Box::new(
         heading_paragraph_with_bookmark(
           chapter_level(chapter),
-          &chapter.name,
+          &chapter_title(cfg, chapter),
           bookmark,
           &docx.styles,
         ),
       )));
     }
-    if chapters.peek().is_some() {
+    if !cfg.chapter_no_pagebreak && chapters.peek().is_some() {
       out.push(BodyChoice::Paragraph(Box::new(page_break_paragraph())));
     }
   }
@@ -833,14 +837,7 @@ fn toc_entry_paragraph(
     .as_ref()
     .map(|path| docx.bookmark_for_path(path))?;
   let level = chapter_level(chapter).clamp(1, 9);
-  let title = if cfg.section_number {
-    chapter.number.as_ref().map_or_else(
-      || chapter.name.clone(),
-      |number| format!("{number} {}", chapter.name),
-    )
-  } else {
-    chapter.name.clone()
-  };
+  let title = chapter_title(cfg, chapter);
 
   Some(Paragraph {
     paragraph_properties: Some(Box::new(toc_entry_properties(level, &docx.styles))),
@@ -897,6 +894,17 @@ fn toc_entry_choices(title: &str, bookmark: &str) -> Vec<ParagraphChoice> {
   ]
 }
 
+fn chapter_title(cfg: &DocxConfig, chapter: &Chapter) -> String {
+  if cfg.section_number {
+    chapter_number_text(chapter).map_or_else(
+      || chapter.name.clone(),
+      |number| format!("{number} {}", chapter.name),
+    )
+  } else {
+    chapter.name.clone()
+  }
+}
+
 fn toc_field_char_run(field_char_type: FieldCharValues, dirty: bool) -> Run {
   Run {
     run_choice: vec![RunChoice::FieldChar(Box::new(FieldChar {
@@ -932,18 +940,12 @@ fn known_xmlns(namespace: XmlKnownNamespace) -> XmlNamespaceDecl {
   XmlNamespaceDecl::Known(namespace)
 }
 
-fn chapter_level(chapter: &Chapter) -> usize {
-  chapter
-    .number
-    .as_ref()
-    .map_or(1, |number| number.len().max(1))
-}
-
 fn chapter_body(
   cfg: &DocxConfig,
   docx: &mut DocxRenderContext<'_>,
   chapter: &Chapter,
 ) -> Result<Vec<BodyChoice>> {
+  let first_heading_level = first_markdown_heading_level(&chapter.content).unwrap_or(1);
   let parser = Parser::new_ext(
     &chapter.content,
     Options::ENABLE_SMART_PUNCTUATION
@@ -961,6 +963,10 @@ fn chapter_body(
   let mut quote_depth = 0usize;
   let mut table: Option<TableBuilder> = None;
   let mut chapter_bookmark = docx.chapter_bookmark(chapter);
+  let mut heading_numberer = cfg
+    .section_number
+    .then(|| HeadingNumberer::new(chapter, first_heading_level))
+    .flatten();
 
   for event in parser {
     if let Some((_, code)) = &mut code_block {
@@ -1011,13 +1017,17 @@ fn chapter_body(
       Event::End(TagEnd::Paragraph) => paragraph.flush_to(&mut out, &mut table),
       Event::Start(Tag::Heading { level, .. }) => {
         let markdown_level = heading_level(level);
-        let level = if cfg.section_number {
-          chapter_level(chapter) + markdown_level - 1
+        let (level, heading_number) = if let Some(heading_numberer) = &mut heading_numberer {
+          let heading_number = heading_numberer.next(markdown_level);
+          (heading_number.level, Some(heading_number.text))
         } else {
-          markdown_level
+          (markdown_level, None)
         };
         paragraph = ParagraphBuilder::with_heading(level, &docx.styles);
         paragraph.bookmark = chapter_bookmark.take();
+        if let Some(number) = heading_number {
+          paragraph.push_text(&format!("{number} "));
+        }
       }
       Event::End(TagEnd::Heading(_)) => paragraph.flush_to(&mut out, &mut table),
       Event::Start(Tag::Emphasis) => paragraph.style.italic += 1,
@@ -2511,9 +2521,25 @@ fn heading_level(level: HeadingLevel) -> usize {
   }
 }
 
+fn first_markdown_heading_level(markdown: &str) -> Option<usize> {
+  Parser::new_ext(
+    markdown,
+    Options::ENABLE_SMART_PUNCTUATION
+      | Options::ENABLE_TABLES
+      | Options::ENABLE_STRIKETHROUGH
+      | Options::ENABLE_TASKLISTS
+      | Options::ENABLE_FOOTNOTES,
+  )
+  .find_map(|event| match event {
+    Event::Start(Tag::Heading { level, .. }) => Some(heading_level(level)),
+    _ => None,
+  })
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+  use ooxmlsdk::sdk::SdkType;
 
   #[test]
   fn document_root_declares_wordprocessing_namespace() {

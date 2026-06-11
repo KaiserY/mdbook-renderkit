@@ -17,6 +17,8 @@ use typst::{LibraryExt, World};
 use typst_kit::fonts::{FontSlot, Fonts};
 use typst_pdf::PdfOptions;
 
+use crate::heading_number::HeadingNumberer;
+
 const DEFAULT_TEMPLATE: &str = include_str!("assets/template.typ");
 const TITLE_PLACEHOLDER: &str = "MDBOOK_RENDERKIT_TITLE";
 const CONTENT_PLACEHOLDER: &str = "/**** MDBOOK_RENDERKIT_CONTENT ****/";
@@ -27,6 +29,7 @@ struct PdfConfig {
   template: Option<PathBuf>,
   admonish: bool,
   section_number: bool,
+  chapter_no_pagebreak: bool,
 }
 
 pub fn render(ctx: &RenderContext) -> Result<()> {
@@ -61,7 +64,9 @@ fn render_typst(ctx: &RenderContext) -> Result<String> {
   for item in ctx.book.iter() {
     if let BookItem::Chapter(chapter) = item {
       render_chapter(ctx, &cfg, chapter, &mut content)?;
-      content.push_str("\n#pagebreak(weak: true)\n\n");
+      if !cfg.chapter_no_pagebreak {
+        content.push_str("\n#pagebreak(weak: true)\n\n");
+      }
     }
   }
 
@@ -168,6 +173,12 @@ fn markdown_to_typst(ctx: &RenderContext, cfg: &PdfConfig, chapter: &Chapter) ->
   let mut inline_stack = Vec::new();
   let mut heading = String::new();
   let mut wrote_invisible_heading = false;
+  let mut heading_numberer = cfg
+    .section_number
+    .then(|| HeadingNumberer::new(chapter, first_heading_level))
+    .flatten();
+  let mut current_heading_level = 1usize;
+  let mut current_heading_number: Option<String> = None;
 
   for event in parser {
     if let Some((_, _, body)) = &mut admonish {
@@ -208,26 +219,48 @@ fn markdown_to_typst(ctx: &RenderContext, cfg: &PdfConfig, chapter: &Chapter) ->
       Event::Start(Tag::Heading { level, .. }) => {
         inline_stack.push(InlineState::Heading);
         heading.clear();
-        let level_usize = markdown_heading_level(chapter, first_heading_level, level as usize);
+        let (level_usize, heading_number) = if let Some(heading_numberer) = &mut heading_numberer {
+          let heading_number = heading_numberer.next(level as usize);
+          (heading_number.level, Some(heading_number.text))
+        } else {
+          ((level as usize).clamp(1, 6), None)
+        };
+        current_heading_level = level_usize;
+        current_heading_number = heading_number;
         output.push_str("#heading(level: ");
         output.push_str(&level_usize.to_string());
-        if !cfg.section_number {
-          output.push_str(", numbering: none");
-        }
+        output.push_str(", numbering: none");
         output.push_str(", outlined: false, bookmarked: false");
         output.push_str(")[");
+        if let Some(number) = &current_heading_number {
+          render_string_text(&mut output, &format!("{number} "));
+        }
       }
-      Event::End(TagEnd::Heading(level)) => {
+      Event::End(TagEnd::Heading(_)) => {
         inline_stack.pop();
-        let level_usize = markdown_heading_level(chapter, first_heading_level, level as usize);
         output.push_str("]\n");
 
         if !wrote_invisible_heading {
-          render_invisible_chapter_heading(&mut output, cfg, chapter, &chapter_ctx, level_usize);
+          let bookmark_title = current_heading_number.as_ref().map_or_else(
+            || heading.trim().to_string(),
+            |number| format!("{number} {heading}"),
+          );
+          render_invisible_chapter_heading(
+            &mut output,
+            chapter,
+            &chapter_ctx,
+            current_heading_level,
+            &bookmark_title,
+          );
           wrote_invisible_heading = true;
         } else {
-          render_invisible_heading(&mut output, level_usize, &heading);
+          let bookmark_title = current_heading_number.as_ref().map_or_else(
+            || heading.trim().to_string(),
+            |number| format!("{number} {heading}"),
+          );
+          render_invisible_heading(&mut output, current_heading_level, &bookmark_title);
         }
+        current_heading_number = None;
 
         output.push('\n');
       }
@@ -373,49 +406,25 @@ fn first_markdown_heading_level(markdown: &str) -> Option<usize> {
   })
 }
 
-fn markdown_heading_level(
-  chapter: &Chapter,
-  first_markdown_level: usize,
-  markdown_level: usize,
-) -> usize {
-  let chapter_depth = chapter
-    .number
-    .as_ref()
-    .map_or(1, |number| number.len().max(1));
-
-  (chapter_depth + markdown_level.saturating_sub(first_markdown_level)).clamp(1, 6)
-}
-
 fn render_invisible_chapter_heading(
   output: &mut String,
-  cfg: &PdfConfig,
   chapter: &Chapter,
   ctx: &ChapterContext<'_>,
   level_usize: usize,
+  title: &str,
 ) {
   output.push('\n');
-
-  if let Some(number) = &chapter.number {
-    if cfg.section_number {
-      output.push_str("#{\n  show heading: none\n  heading(numbering: none, level: ");
-      output.push_str(&number.len().to_string());
-      output.push_str(", outlined: true, bookmarked: true)[#\"");
-      output.push_str(&escape_typst_string(&format!("{number} {}", chapter.name)));
-      output.push_str("\"]\n} <");
-    } else {
-      output.push_str("#{\n  show heading: none\n  heading(numbering: none, level: ");
-      output.push_str(&level_usize.to_string());
-      output.push_str(", outlined: true, bookmarked: true)[");
-      output.push_str(&escape_typst(&chapter.name));
-      output.push_str("]\n} <");
-    }
+  let title = if title.trim().is_empty() {
+    chapter.name.as_str()
   } else {
-    output.push_str(
-            "#{\n  show heading: none\n  heading(numbering: none, level: 1, outlined: true, bookmarked: true)[",
-        );
-    output.push_str(&escape_typst(&chapter.name));
-    output.push_str("]\n} <");
-  }
+    title.trim()
+  };
+
+  output.push_str("#{\n  show heading: none\n  heading(numbering: none, level: ");
+  output.push_str(&level_usize.clamp(1, 6).to_string());
+  output.push_str(", outlined: true, bookmarked: true)[");
+  render_string_text(output, title);
+  output.push_str("]\n} <");
 
   output.push_str(&ctx.label);
   output.push_str(">\n");
@@ -429,8 +438,14 @@ fn render_invisible_heading(output: &mut String, level: usize, text: &str) {
   output.push_str("#{\n  show heading: none\n  heading(numbering: none, level: ");
   output.push_str(&level.clamp(1, 6).to_string());
   output.push_str(", outlined: true, bookmarked: true)[");
-  output.push_str(&escape_typst(text.trim()));
+  render_string_text(output, text.trim());
   output.push_str("]\n}\n");
+}
+
+fn render_string_text(output: &mut String, text: &str) {
+  output.push_str("#\"");
+  output.push_str(&escape_typst_string(text));
+  output.push('"');
 }
 
 fn render_link_start(output: &mut String, ctx: &ChapterContext<'_>, dest_url: &str) {
